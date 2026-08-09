@@ -1,0 +1,1940 @@
+include("../../../diagonal_sbp.jl")
+
+using SparseArrays
+using SparseArrayKit
+# using CUDA
+# Zac's Addition
+using Base.Threads
+
+⊗(A,B) = kron(A, B)
+# = = = = = == = = = = = = = = = = 
+# Metrics Functions
+# = = = = = = = = = = = = = = = = 
+# = = = = = = = = = = =
+# Pulling out functionality from create metrics:
+# = = = = = = = = = = = =
+"""
+Compute the Jacobian determinant and inverse metric terms (∂ξ/∂x etc.)
+from the physical coordinate derivatives.
+"""
+function compute_jacobian_and_inverses(xq, xr, xs, yq, yr, ys, zq, zr, zs)
+    J = xq .* (yr .* zs - zr .* ys) - xr .* (yq .* zs - zq .* ys) + xs .* (yq .* zr - zq .* yr)
+
+    @assert minimum(J) >= 1e-12 "Non-positive Jacobian detected"
+
+    qx =  (yr .* zs - ys .* zr) ./ J
+    qy = -(xr .* zs - xs .* zr) ./ J
+    qz =  (xr .* ys - xs .* yr) ./ J
+    rx = -(yq .* zs - ys .* zq) ./ J
+    ry =  (xq .* zs - xs .* zq) ./ J
+    rz = -(xq .* ys - xs .* yq) ./ J
+    sx =  (yq .* zr - yr .* zq) ./ J
+    sy = -(xq .* zr - xr .* zq) ./ J
+    sz =  (xq .* yr - xr .* yq) ./ J
+
+    return J, (qx, qy, qz, rx, ry, rz, sx, sy, sz)
+end
+
+
+"""
+Helper function for kronecker delta (i == j) = 1 else 0
+"""
+function delt(i, j)
+    if i == j 
+        return 1
+    else
+        return 0
+    end
+end
+
+"""
+metric_deriv(phys_dir, ref_dir, qrs) returns ∂(ref_coord)/∂(phys_coord).
+phys_dir: 1=x, 2=y, 3=z
+ref_dir:  1=q, 2=r, 3=s
+
+Examples:
+  metric_deriv(1, 1, qrs) == qx   (∂q/∂x)
+  metric_deriv(2, 1, qrs) == rx   (∂r/∂x)
+  metric_deriv(3, 2, qrs) == sy   (∂s/∂y)
+"""
+function metric_deriv(phys_dir::Int, ref_dir::Int, qrs::NTuple{9})
+    return qrs[3 * (ref_dir - 1) + phys_dir]
+end
+
+"""
+Compute outward unit normals and surface Jacobians for one face.
+`cross_vecs`: two 2D tangent arrays as (u1, u2) where n = u1 × u2.
+`sign`: +1 or -1 for outward orientation.
+"""
+function compute_face_normals(u1x, u1y, u1z, u2x, u2y, u2z; sign=1)
+    nx = sign .* (u1y .* u2z - u1z .* u2y)
+    ny = sign .* (-(u1x .* u2z - u1z .* u2x))
+    nz = sign .* (u1x .* u2y - u1y .* u2x)
+    sJ = hypot.(nx, ny, nz)
+    return nx ./ sJ, ny ./ sJ, nz ./ sJ, sJ
+end
+
+"""
+Create metrics for a given block to operator order pm, of dimensions Nq + 1, Nr + 1, Ns + 1.
+Originally designed for SCEC's SEAS BP5 and other BPs by Prof. Brittany Erickson and Dr. Jeremy Kozdon.
+    
+INPUTS: 
+     
+"""
+function create_metrics_bp5(pm::Int, Nq::Int, Nr::Int, Ns::Int, λ, μ, K, B_p;
+                        xf=(q,r,s)->(q, ones(size(q)), zeros(size(r)), zeros(size(s))),
+                        yf=(q,r,s)->(r, zeros(size(q)), ones(size(r)), zeros(size(s))),
+                        zf=(q,r,s)->(s, zeros(size(q)), zeros(size(r)), ones(size(s))),
+                        xc=(-1,1), yc=(-1,1), zc=(-1,1))
+  
+        Nqp = Nq + 1
+        Nrp = Nr + 1
+        Nsp = Ns + 1
+        Np = Nqp * Nrp * Nsp
+
+        # Derivative operators for the metric terms
+        @assert pm <= 8
+        pp = pm == 6 ? 8 : pm
+
+        q = range(xc[1], stop=xc[2], length=Nqp)
+        r = range(yc[1], stop=yc[2], length=Nrp)
+        s = range(zc[1], stop=zc[2], length=Nsp)
+
+        # Create the mesh
+
+        q = (q * ones(1, Nrp)) .* reshape(ones(Nsp), 1, 1, :)
+        r = (ones(Nqp) * r') .* reshape(ones(Nsp), 1, 1, :)
+        s = (ones(Nqp) * ones(1, Nrp)) .* reshape(s, 1, 1, :) # possible source for error? 
+        
+        (x, xq, xr, xs) = xf(q, r, s)
+
+        (y, yq, yr, ys) = yf(q, r, s)
+        (z, zq, zr, zs) = zf(q, r, s)
+
+        J, (qx, qy, qz, rx, ry, rz, sx, sy, sz) = compute_jacobian_and_inverses(xq, xr, xs, yq, yr, ys, zq, zr, zs)
+        
+
+        @assert minimum(J) >= 1e-12
+
+        qx =  (yr .* zs - ys .* zr) ./ J 
+        qy = -(xr .* zs - xs .* zr) ./ J 
+        qz =  (xr .* ys - xs .* yr) ./ J 
+        rx = -(yq .* zs - ys .* zq) ./ J
+        ry =  (xq .* zs - xs .* zq) ./ J
+        rz = -(xq .* ys - xs .* yq) ./ J
+        sx =  (yq .* zr - yr .* zq) ./ J
+        sy = -(xq .* zr - xr .* zq) ./ J
+        sz =  (xq .* yr - xr .* yq) ./ J
+        qrs = (qx, qy, qz, rx, ry, rz, sx, sy, sz)
+
+        
+        # variable coefficient matrix components
+        C = [zeros(Nqp, Nrp, Nsp) for _ in 1:3, _ in 1:3, _ in 1:3, _ in 1:3]
+        lam = λ(x, y, z, B_p)
+        mu  = μ(x, y, z, B_p)
+        for i = 1:3
+            for j = 1:3
+                for k = 1:3
+                    for l = 1:3
+                        lambda_term = lam .* metric_deriv(j, i, qrs) .* metric_deriv(l, k, qrs)
+                        
+                        # μ term 1: δ_jl * Σ_m F(m,i)*F(m,k)  — the "trace" contraction
+                        mu_trace = sum(metric_deriv(m, i, qrs) .* metric_deriv(m, k, qrs) for m in 1:3)
+                        mu_term1 = mu .* delt(j, l) .* mu_trace
+                        
+                        # μ term 2: F(l,i) * F(j,k)  — the symmetrizing term
+                        mu_term2 = mu .* metric_deriv(l, i, qrs) .* metric_deriv(j, k, qrs)
+                        C[i, j, k, l] = J .* (lambda_term + mu_term1 + mu_term2)
+                    end
+                end
+            end
+        end
+
+        #
+        # Block surface matrices
+        #
+        (xf1, yf1, zf1) = (view(x, 1, :, :), view(y, 1, :, :), view(z, 1, :, :))
+        nx1 =   ys[1, :, :] .* zr[1, :, :] - yr[1, :, :] .* zs[1, :, :]
+        ny1 = -(xs[1, :, :] .* zr[1, :, :] - xr[1, :, :] .* zs[1, :, :])
+        nz1 =   xs[1, :, :] .* yr[1, :, :] - xr[1, :, :] .* ys[1, :, :]
+        sJ1 = hypot.(nx1, ny1, nz1)
+        nx1 = nx1 ./ sJ1
+        ny1 = ny1 ./ sJ1
+        nz1 = nz1 ./ sJ1
+
+           
+
+
+        (xf2, yf2, zf2) = (view(x, Nqp, :, :), view(y, Nqp, :, :), view(z, Nqp, :, :))
+        nx2 =    yr[end, :, :] .* zs[end, :, :] - ys[end, :, :] .* zr[end, :, :]
+        ny2 =  -(xr[end, :, :] .* zs[end, :, :] - xs[end, :, :] .* zr[end, :, :])
+        nz2 =    xr[end, :, :] .* ys[end, :, :] - xs[end, :, :] .* yr[end, :, :]
+        sJ2 = hypot.(nx2, ny2, nz2)
+        nx2 = nx2 ./ sJ2
+        ny2 = ny2 ./ sJ2
+        nz2 = nz2 ./ sJ2
+
+        (xf3, yf3, zf3) = (view(x, :, 1, :), view(y, :, 1, :), view(z, :, 1, :))
+        nx3 =   yq[:, 1, :] .* zs[:, 1, :] - ys[:, 1, :] .* zq[:, 1, :]
+        ny3 = -(xq[:, 1, :] .* zs[:, 1, :] - xs[:, 1, :] .* zq[:, 1, :])
+        nz3 =   xq[:, 1, :] .* ys[:, 1, :] - xs[:, 1, :] .* yq[:, 1, :]
+        sJ3 = hypot.(nx3, ny3, nz3)
+        nx3 = nx3 ./ sJ3
+        ny3 = ny3 ./ sJ3
+        nz3 = nz3 ./ sJ3
+
+
+        (xf4, yf4, zf4) = (view(x, :, Nrp, :), view(y, :, Nrp, :), view(z, :, Nrp, :))
+        nx4 =    ys[:, end, :] .* zq[:, end, :] - yq[:, end, :] .* zs[:, end, :]
+        ny4 =  -(xs[:, end, :] .* zq[:, end, :] - xq[:, end, :] .* zs[:, end, :])
+        nz4 =    xs[:, end, :] .* yq[:, end, :] - xq[:, end, :] .* ys[:, end, :]
+        sJ4 = hypot.(nx4, ny4, nz4)
+        nx4 = nx4 ./ sJ4
+        ny4 = ny4 ./ sJ4
+        nz4 = nz4 ./ sJ4
+
+        (xf5, yf5, zf5) = (view(x, :, :, 1), view(y, :, :, 1), view(z, :, :, 1))
+        nx5 =   yr[:, :, 1] .* zq[:, :, 1] - yq[:, :, 1] .* zr[:, :, 1]
+        ny5 = -(xr[:, :, 1] .* zq[:, :, 1] - xq[:, :, 1] .* zr[:, :, 1])
+        nz5 =  xr[:, :, 1] .* yq[:, :, 1] - xq[:, :, 1] .* yr[:, :, 1]
+        sJ5 = hypot.(nx5, ny5, nz5)
+        nx5 = nx5 ./ sJ5
+        ny5 = ny5 ./ sJ5
+        nz5 = nz5 ./ sJ5
+
+        (xf6, yf6, zf6) = (view(x, :, :, Nsp), view(y, :, :, Nsp), view(z, :, :, Nsp))
+        nx6 =   yq[:, :, end] .* zr[:, :, end] - yr[:, :, end] .* zq[:, :, end]
+        ny6 = -(xq[:, :, end] .* zr[:, :, end] - xr[:, :, end] .* zq[:, :, end])
+        nz6 =   xq[:, :, end] .* yr[:, :, end] - xr[:, :, end] .* yq[:, :, end]
+        
+        sJ6 = hypot.(nx6, ny6, nz6)
+        nx6 = nx6 ./ sJ6
+        ny6 = ny6 ./ sJ6
+        nz6 = nz6 ./ sJ6
+
+        (coord = (x,y, z),
+        facecoord = ((xf1, xf2, xf3, xf4, xf5, xf6), (yf1, yf2, yf3, yf4, yf5, yf6), (zf1, zf2, zf3, zf4, zf5, zf6)),
+        C = C,
+        J=J,
+        sJ = (sJ1, sJ2, sJ3, sJ4, sJ5, sJ6),
+        nx = (nx1, nx2, nx3, nx4, nx5, nx6),
+        ny = (ny1, ny2, ny3, ny4, ny5, ny6),
+        nz = (nz1, nz2, nz3, nz4, nz5, nz6),
+        qx = qx, qy = qy, qz = qz, 
+        rx = rx, ry = ry, rz = rz,
+        sx = sx, sy = sy, sz = sz)
+end
+
+# = = = = = = = = = = =
+# 3D Derivative Operators
+# = = = = = = = = = = = =
+
+"""
+# - - -- -- --- ---- -- - - - -- -- -- -- - - 
+# Multithreaded D2 Operator Creator
+# Additions:
+#   - Parallelism with par and nest 
+#       - par indicates any multithreading D2 creation
+#       - nest indicates use nested parallelism ~60 threads works well for 100x100x100
+#       - Need par = true for any parallelism
+#   - Interface: 
+# - - - --- -- --- -- - -- - - - - -- - - - - -- 
+"""
+function locoperator_bp5(p, Nq, Nr, Ns, metrics; par=true, nest=true, xt=(-1, 1), yt=(-1, 1), zt=(-1,1), interface=false, int_side = 0, mode="default")
+    Nqp = Nq + 1
+    Nrp = Nr + 1
+    Nsp = Ns + 1
+    Np = Nqp * Nrp * Nsp
+
+    (sJ1, sJ2, sJ3, sJ4, sJ5, sJ6) = metrics.sJ
+    J = metrics.J
+    C = metrics.C
+
+    nx = metrics.nx
+    ny = metrics.ny
+    nz = metrics.nz
+ 
+    # FACE 1
+    Nx1 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nx1 .= 0
+    Nx1[1, :, :] = metrics.nx[1]
+    Nx1 = spdiagm(0 => Nx1[:])
+    
+    Ny1 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Ny1 .= 0
+    Ny1[1, :, :] = metrics.ny[1]
+    Ny1 = spdiagm(0 => Ny1[:])
+    Nz1 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nz1 .= 0
+    Nz1[1, :, :] = metrics.nz[1]
+    Nz1 = spdiagm(0 => Nz1[:])
+
+  
+    # FACE 2
+    Nx2 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nx2 .= 0
+    Nx2[Nqp, :, :] = metrics.nx[2]
+    Nx2 = spdiagm(0 => Nx2[:])
+    Ny2 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Ny2 .= 0
+    Ny2[Nqp, :, :] = metrics.ny[2]
+    Ny2 = spdiagm(0 => Ny2[:])
+    Nz2 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nz2 .= 0
+    Nz2[Nqp, :, :] = metrics.nz[2]
+    Nz2 = spdiagm(0 => Nz2[:])
+
+    # FACE 3
+    Nx3 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nx3 .= 0
+    Nx3[:, 1, :] = metrics.nx[3]
+    Nx3 = spdiagm(0 => Nx3[:])
+    Ny3 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Ny3 .= 0
+    Ny3[:, 1, :] = metrics.ny[3]
+    Ny3 = spdiagm(0 => Ny3[:])
+    Nz3 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nz3 .= 0
+    Nz3[:, 1, :] = metrics.nz[3]
+    Nz3 = spdiagm(0 => Nz3[:])
+
+        # FACE 3
+    Nx3 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nx3 .= 0
+    Nx3[:, 1, :] = metrics.nx[3]
+    Nx3 = spdiagm(0 => Nx3[:])
+    Ny3 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Ny3 .= 0
+    Ny3[:, 1, :] = metrics.ny[3]
+    Ny3 = spdiagm(0 => Ny3[:])
+    Nz3 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nz3 .= 0
+    Nz3[:, 1, :] = metrics.nz[3]
+    Nz3 = spdiagm(0 => Nz3[:])
+
+    # FACE 4
+    Nx4 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nx4 .= 0
+    Nx4[:, Nrp, :] = metrics.nx[4]
+    Nx4 = spdiagm(0 => Nx4[:])
+    Ny4 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Ny4 .= 0
+    Ny4[:, Nrp, :] = metrics.ny[4]
+    Ny4 = spdiagm(0 => Ny4[:])
+    Nz4 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nz4 .= 0
+    Nz4[:, Nrp, :] = metrics.nz[4]
+    Nz4 = spdiagm(0 => Nz4[:])
+   
+    # FACE 5
+    Nx5 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nx5 .= 0
+    Nx5[:, :, 1] = metrics.nx[5]
+    Nx5 = spdiagm(0 => Nx5[:])
+    Ny5 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Ny5 .= 0
+    Ny5[:, :, 1] = metrics.ny[5]
+    Ny5 = spdiagm(0 => Ny5[:])
+    Nz5 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nz5 .= 0
+    Nz5[:, :, 1] = metrics.nz[5]
+    Nz5 = spdiagm(0 => Nz5[:])
+  
+    # FACE 6
+    Nx6 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nx6 .= 0
+    Nx6[:, :, Nsp] = metrics.nx[6]
+    Nx6 = spdiagm(0 => Nx6[:])
+    Ny6 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Ny6 .= 0
+    Ny6[:, :, Nsp] = metrics.ny[6]
+    Ny6 = spdiagm(0 => Ny6[:])
+    Nz6 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    Nz6 .= 0
+    Nz6[:, :, Nsp] = metrics.nz[6]
+    Nz6 = spdiagm(0 => Nz6[:])
+    # define Jacobian matrix evaluated on faces: (are these same as surface J??)
+
+    EsJ1 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    EsJ1 .= 0
+    EsJ1[1, :, :] = sJ1 ./ J[1, :, :]
+
+    EsJ2 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    EsJ2 .= 0
+    EsJ2[end, :, :] = sJ2 ./ J[end, :, :]
+
+    EsJ3 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    EsJ3 .= 0
+    EsJ3[:, 1, :] = sJ3 ./ J[:, 1, :]
+    EsJ4 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    EsJ4 .= 0
+    EsJ4[:, end, :] = sJ4 ./ J[:, end, :]
+
+    EsJ5 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    EsJ5 .= 0
+    EsJ5[:, :, 1] = sJ5 ./ J[:, :, 1]
+    EsJ6 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    EsJ6 .= 0
+    EsJ6[:, :, end] = sJ6 ./ J[:, :, end]
+
+
+    sJI1 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    sJI1 .= 0
+    sJI1[1, :, :] = 1 ./ sJ1
+    sJI1 =   spdiagm(0 =>  sJI1[:])
+
+    sJI2 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    sJI2 .= 0
+    sJI2[end, :, :] = 1 ./ sJ2
+    sJI2 =   spdiagm(0 =>  sJI2[:])
+
+    sJI3 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    sJI3 .= 0
+    sJI3[:, 1, :] = 1 ./ sJ3
+    sJI3 =   spdiagm(0 =>  sJI3[:])
+
+    sJI4 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    sJI4 .= 0
+    sJI4[:, end, :] = 1 ./ sJ4
+    sJI4 =   spdiagm(0 =>  sJI4[:])
+
+    sJI5 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    sJI5 .= 0
+    sJI5[:, :, 1] = 1 ./ sJ5
+    sJI5 =   spdiagm(0 =>  sJI5[:])
+
+    sJI6 = SparseArray{Float64, 3}(undef, (Nqp, Nrp, Nsp)) 
+    sJI6 .= 0
+    sJI6[:, :, end] = 1 ./ sJ6
+    sJI6 =   spdiagm(0 =>  sJI6[:])
+
+
+    # Turn J and sJ's into diagonal matrices
+    JI =  spdiagm(0 => 1 ./ J[:])
+    J =   spdiagm(0 => J[:])
+    sJ1 = spdiagm(0 => sJ1[:])
+    sJ2 = spdiagm(0 => sJ2[:])
+    sJ3 = spdiagm(0 => sJ3[:])
+    sJ4 = spdiagm(0 => sJ4[:])
+    sJ5 = spdiagm(0 => sJ5[:])
+    sJ6 = spdiagm(0 => sJ6[:])
+
+    EsJ1 = spdiagm(0 => EsJ1[:])
+    EsJ2 = spdiagm(0 => EsJ2[:])
+    EsJ3 = spdiagm(0 => EsJ3[:])
+    EsJ4 = spdiagm(0 => EsJ4[:])
+    EsJ5 = spdiagm(0 => EsJ5[:])
+    EsJ6 = spdiagm(0 => EsJ6[:])
+
+    sJs = (sJ1, sJ2, sJ3, sJ4, sJ5, sJ6)
+
+    c = fill(spzeros(Nqp*Nrp*Nsp, Nqp*Nrp*Nsp), 3, 3, 3, 3)
+   
+    for i = 1:3
+        for j = 1:3
+            for k = 1:3
+                for l = 1:3
+                    c[i, j, k, l] = spdiagm(0 => C[i, j, k, l][:])
+                end
+            end
+        end
+    end
+    
+
+    # First derivative operators:
+    (Dq, HqI, Hq, q) = diagonal_sbp_D1(p, Nq; xc = xt)
+    Qq = Hq * Dq
+    QqT = sparse(transpose(Qq))
+
+    (Dr, HrI, Hr, r) = diagonal_sbp_D1(p, Nr; xc = yt)
+    Qr = Hr * Dr
+    QrT = sparse(transpose(Qr))
+
+    (Ds, HsI, Hs, s) = diagonal_sbp_D1(p, Ns; xc = zt)
+    Qs = Hs * Ds
+    QsT = sparse(transpose(Qs))
+
+    # Identity matrices for the comuptation
+    Iq = sparse(I, Nqp, Nqp)
+    Ir = sparse(I, Nrp, Nrp)
+    Is = sparse(I, Nsp, Nsp)
+
+  
+        #Variable Coefficient Pure Second Derivative Operators
+        (D2q, S0q, SNq, _, _, _) = diagonal_sbp_D2(p, Nq; xc = xt)
+        (D2r, S0r, SNr, _, _, _) = diagonal_sbp_D2(p, Nr; xc = yt)
+        (D2s, S0s, SNs, _, _, _) = diagonal_sbp_D2(p, Ns; xc = zt)
+
+        D11 = fill(spzeros(Nqp*Nrp*Nsp, Nqp*Nrp*Nsp), 3, 3)
+        D12 = fill(spzeros(Nqp*Nrp*Nsp, Nqp*Nrp*Nsp), 3, 3)
+        D13 = fill(spzeros(Nqp*Nrp*Nsp, Nqp*Nrp*Nsp), 3, 3)
+        D21 = fill(spzeros(Nqp*Nrp*Nsp, Nqp*Nrp*Nsp), 3, 3)
+        D22 = fill(spzeros(Nqp*Nrp*Nsp, Nqp*Nrp*Nsp), 3, 3)
+        D23 = fill(spzeros(Nqp*Nrp*Nsp, Nqp*Nrp*Nsp), 3, 3)
+        D31 = fill(spzeros(Nqp*Nrp*Nsp, Nqp*Nrp*Nsp), 3, 3)
+        D32 = fill(spzeros(Nqp*Nrp*Nsp, Nqp*Nrp*Nsp), 3, 3)
+        D33 = fill(spzeros(Nqp*Nrp*Nsp, Nqp*Nrp*Nsp), 3, 3)
+
+        test_i = [1, 1, 1, 2, 2, 2, 3, 3, 3]
+        test_j = [1, 2, 3, 1, 2, 3, 1, 2, 3]
+        if !par && !nest # basic 9 thread, each gets a block
+            Threads.@threads :static for x = 1:9
+                local idx = x
+                local i = test_i[idx]
+                local j = test_j[idx]
+                #D11[i, j] = c[1, i, 1, j] * JI * (Is ⊗ Ir ⊗ D2q)
+                (D11[i, j], _, _) = var_3D_D2q(p, Nqp, Nrp, Nsp, metrics.C[1, i, 1, j], HqI; xc = xt)
+                D11[i, j] = JI * D11[i, j]
+                D12[i, j] = c[1, i, 2, j] * JI * (Is ⊗ Dr ⊗ Dq)
+                D13[i, j] = c[1, i, 3, j] * JI * (Ds ⊗ Ir ⊗ Dq)
+
+                D21[i, j] = c[2, i, 1, j] * JI * (Is ⊗ Dr ⊗ Dq)
+                    #D22[i, j] = c[2, i, 2, j] * JI * (Is ⊗ D2r ⊗ Iq)
+                (D22[i, j], _, _) = var_3D_D2r(p, Nqp, Nrp, Nsp, metrics.C[2, i, 2, j], HrI; xc = yt)
+                D22[i, j] = JI * D22[i, j]
+                D23[i, j] = c[2, i, 3, j] * JI * (Ds ⊗ Dr ⊗ Iq)
+
+                D31[i, j] = c[3, i, 1, j] * JI * (Ds ⊗ Ir ⊗ Dq)
+                D32[i, j] = c[3, i, 2, j] * JI * (Ds ⊗ Dr ⊗ Iq)
+                    #D33[i, j] = c[3, i, 3, j] * JI * (D2s ⊗ Ir ⊗ Iq)
+                (D33[i, j], _, _) = var_3D_D2s(p, Nqp, Nrp, Nsp, metrics.C[3, i, 3, j], HsI; xc = zt)
+                D33[i, j] = JI * D33[i, j]
+                #print("\nFinished Index:$(Threads.threadid()) $(i), $(j)\n")
+            end
+        end
+        if par && !nest # divide each block into qrs comps
+            Threads.@threads :static for x = 1:27
+                local idx_x = x # actual t id
+                local idx = (x-1) % 9 + 1 # we're going to repeat this 3 times fuck julia ... jk jk
+
+                local i = test_i[idx]
+                local j = test_j[idx]
+                #D11[i, j] = c[1, i, 1, j] * JI * (Is ⊗ Ir ⊗ D2q)
+                Eq0 = sparse([1], [1], [1], Nqp, Nqp)
+                Eq0 = sparse([Nqp], [Nqp], [1], Nqp, Nqp)
+                if 0 < idx_x && idx_x <= 9 
+                    (D11[i, j], S0_11, SN_11) = var_3D_D2q(p, Nqp, Nrp, Nsp, metrics.C[1, i, 1, j], HqI; xc = xt)
+                    D11[i, j] = D11[i, j]
+                    D11[i, j] = JI * D11[i, j]
+                    D12[i, j] = c[1, i, 2, j] * JI * (Is ⊗ Dr ⊗ Dq)
+                    D13[i, j] = c[1, i, 3, j] * JI * (Ds ⊗ Ir ⊗ Dq)
+
+                elseif 10 <= idx_x && idx_x <= 18
+                    D21[i, j] = c[2, i, 1, j] * JI * (Is ⊗ Dr ⊗ Dq)
+                        #D22[i, j] = c[2, i, 2, j] * JI * (Is ⊗ D2r ⊗ Iq)
+                    (D22[i, j], _, _) = var_3D_D2r(p, Nqp, Nrp, Nsp, metrics.C[2, i, 2, j], HrI; xc = yt)
+                    D22[i, j] = JI * D22[i, j]
+                    D23[i, j] = c[2, i, 3, j] * JI * (Ds ⊗ Dr ⊗ Iq)
+                elseif 19 <= idx_x && idx_x <= 27
+
+                    D31[i, j] = c[3, i, 1, j] * JI * (Ds ⊗ Ir ⊗ Dq)
+                    D32[i, j] = c[3, i, 2, j] * JI * (Ds ⊗ Dr ⊗ Iq)
+                        #D33[i, j] = c[3, i, 3, j] * JI * (D2s ⊗ Ir ⊗ Iq)
+                    (D33[i, j], _, _) = var_3D_D2s(p, Nqp, Nrp, Nsp, metrics.C[3, i, 3, j], HsI; xc = zt)
+                    D33[i, j] = JI * D33[i, j]
+                else
+                    print("\nUH OH something broke in Multithreaded operator")
+                end
+            end
+        end
+        # Super  
+        if par && nest # Go HAM
+            Threads.@threads  for x = 1:27
+                local idx_x = x # actual t id
+                local idx = (x-1) % 9 + 1 # we're going to repeat this 3 times fuck julia ... jk jk
+
+                local i = test_i[idx]
+                local j = test_j[idx]
+                #D11[i, j] = c[1, i, 1, j] * JI * (Is ⊗ Ir ⊗ D2q)
+                Eq0 = sparse([1], [1], [1], Nqp, Nqp)
+                Eq0 = sparse([Nqp], [Nqp], [1], Nqp, Nqp)
+                if 0 < idx_x && idx_x <= 9 
+                    (D11[i, j], S0_11, SN_11) = var_3D_D2q_fast(p, Nqp, Nrp, Nsp, metrics.C[1, i, 1, j], HqI; xc = xt, par=true)
+                    D11[i, j] = JI * D11[i, j]
+                    D12[i, j] = c[1, i, 2, j] * JI * (Is ⊗ Dr ⊗ Dq)
+                    D13[i, j] = c[1, i, 3, j] * JI * (Ds ⊗ Ir ⊗ Dq)
+
+                elseif 10 <= idx_x && idx_x <= 18
+                    D21[i, j] = c[2, i, 1, j] * JI * (Is ⊗ Dr ⊗ Dq)
+                        #D22[i, j] = c[2, i, 2, j] * JI * (Is ⊗ D2r ⊗ Iq)
+                    (D22[i, j], _, _) = var_3D_D2r_fast(p, Nqp, Nrp, Nsp, metrics.C[2, i, 2, j], HrI; xc = yt, par=true)
+                    D22[i, j] = JI * D22[i, j]
+                    D23[i, j] = c[2, i, 3, j] * JI * (Ds ⊗ Dr ⊗ Iq)
+                elseif 19 <= idx_x && idx_x <= 27
+
+                    D31[i, j] = c[3, i, 1, j] * JI * (Ds ⊗ Ir ⊗ Dq)
+                    D32[i, j] = c[3, i, 2, j] * JI * (Ds ⊗ Dr ⊗ Iq)
+                        #D33[i, j] = c[3, i, 3, j] * JI * (D2s ⊗ Ir ⊗ Iq)
+                    (D33[i, j], _, _) = var_3D_D2s_fast(p, Nqp, Nrp, Nsp, metrics.C[3, i, 3, j], HsI; xc = zt, par=true)
+                    D33[i, j] = JI * D33[i, j]
+                else
+                    print("\nUH OH something broke in Multithreaded operator")
+                end
+            end
+        end
+
+
+        A11 = D11[1, 1] .+ D12[1, 1] .+ D13[1, 1] .+ 
+            D21[1, 1] .+ D22[1, 1] .+ D23[1, 1] .+ 
+            D31[1, 1] .+ D32[1, 1] .+ D33[1, 1]
+
+        A12 = D11[1, 2] .+ D12[1, 2] .+ D13[1, 2] .+ 
+            D21[1, 2] .+ D22[1, 2] .+ D23[1, 2] .+ 
+            D31[1, 2] .+ D32[1, 2] .+ D33[1, 2]
+
+        A13 = D11[1, 3] .+ D12[1, 3] .+ D13[1, 3] .+ 
+            D21[1, 3] .+ D22[1, 3] .+ D23[1, 3] .+ 
+            D31[1, 3] .+ D32[1, 3] .+ D33[1, 3]
+
+        A21 = D11[2, 1] .+ D12[2, 1] .+ D13[2, 1] .+ 
+            D21[2, 1] .+ D22[2, 1] .+ D23[2, 1] .+ 
+            D31[2, 1] .+ D32[2, 1] .+ D33[2, 1]
+
+        A22 = D11[2, 2] .+ D12[2, 2] .+ D13[2, 2] .+ 
+            D21[2, 2] .+ D22[2, 2] .+ D23[2, 2] .+ 
+            D31[2, 2] .+ D32[2, 2] .+ D33[2, 2]      
+
+        A23 = D11[2, 3] .+ D12[2, 3] .+ D13[2, 3] .+ 
+            D21[2, 3] .+ D22[2, 3] .+ D23[2, 3] .+ 
+            D31[2, 3] .+ D32[2, 3] .+ D33[2, 3]
+
+        A31 = D11[3, 1] .+ D12[3, 1] .+ D13[3, 1] .+ 
+            D21[3, 1] .+ D22[3, 1] .+ D23[3, 1] .+ 
+            D31[3, 1] .+ D32[3, 1] .+ D33[3, 1]
+
+        A32 = D11[3, 2] .+ D12[3, 2] .+ D13[3, 2] .+ 
+            D21[3, 2] .+ D22[3, 2] .+ D23[3, 2] .+ 
+            D31[3, 2] .+ D32[3, 2] .+ D33[3, 2]
+
+        A33 = D11[3, 3] .+ D12[3, 3] .+ D13[3, 3] .+ 
+            D21[3, 3] .+ D22[3, 3] .+ D23[3, 3] .+ 
+            D31[3, 3] .+ D32[3, 3] .+ D33[3, 3]
+    
+    
+
+     # Surface mass matrices
+    #
+    H1 = H2 = Hs ⊗ Hr
+    H1I = H2I = HsI ⊗ HrI
+
+    H3 = H4 = Hs ⊗ Hq
+    H3I = H4I = HsI ⊗ HqI
+
+    H5 = H6 = Hr ⊗ Hq
+    H5I = H6I = HrI ⊗ HqI
+
+    # Volume matrices
+    H = Hs ⊗ Hr ⊗ Hq
+    HI = HsI ⊗ HrI ⊗ HqI
+    JHI = HI * JI
+    JIm = kron(Is, Ir, Iq) * JI # Adding this in for operators
+
+        # Create Face Restriction Operators (e1T, e2T, etc) - these need to be checked
+    eq0 = sparse([1  ], [1], [1], Nqp, 1)
+    eqN = sparse([Nqp], [1], [1], Nqp, 1)
+    er0 = sparse([1  ], [1], [1], Nrp, 1)
+    erN = sparse([Nrp], [1], [1], Nrp, 1)
+    es0 = sparse([1  ], [1], [1], Nsp, 1)
+    esN = sparse([Nsp], [1], [1], Nsp, 1)
+    e1 = Is ⊗ Ir ⊗ eq0
+    e2 = Is ⊗ Ir ⊗ eqN
+    e3 = Is ⊗ er0 ⊗ Iq
+    e4 = Is ⊗ erN ⊗ Iq
+    e5 = es0 ⊗ Ir ⊗ Iq
+    e6 = esN ⊗ Ir ⊗ Iq
+    e1T = Is ⊗ Ir ⊗ eq0'
+    e2T = Is ⊗ Ir ⊗ eqN'
+    e3T = Is ⊗ er0' ⊗ Iq
+    e4T = Is ⊗ erN' ⊗ Iq
+    e5T = es0' ⊗ Ir ⊗ Iq
+    e6T = esN' ⊗ Ir ⊗ Iq
+    # JIm = spdiagm(0 => JI[:])
+    # Create 3D ops from 1D
+    
+    Dq3 = Is ⊗ Ir ⊗ Dq
+    Dr3 = Is ⊗ Dr ⊗ Iq
+    Ds3 = Ds ⊗ Ir ⊗ Iq
+
+    # Face operators to reduce computations involing T11
+
+    Sq = Is ⊗ Ir ⊗ (S0q + SNq)
+    Sr = Is ⊗ (S0r+SNr) ⊗ Iq
+    Ss = (S0s + SNs) ⊗ Ir ⊗ Iq
+   
+
+    
+# Create traction operators on each face
+# factor for turning T's on/off, default to c = 1
+
+j = 1
+
+# FACE 1
+# (nq, nr, ns) = (-1, 0, 0)
+    # Was working ... 
+    T11_1 = -(sJI1) *(c[1,1,1,1]*Sq + c[1,1,2,1]*Dr3 + c[1,1,3,1]*Ds3)
+    T12_1 = -(sJI1) *(c[1,1,1,2]*Sq + c[1,1,2,2]*Dr3 + c[1,1,3,2]*Ds3) 
+    T13_1 = -(sJI1) *(c[1,1,1,3]*Sq + c[1,1,2,3]*Dr3 + c[1,1,3,3]*Ds3)
+    T21_1 = -(sJI1) *(c[1,2,1,1]*Sq + c[1,2,2,1]*Dr3 + c[1,2,3,1]*Ds3)
+    T22_1 = -(sJI1) *(c[1,2,1,2]*Sq + c[1,2,2,2]*Dr3 + c[1,2,3,2]*Ds3) 
+    T23_1 = -(sJI1) *(c[1,2,1,3]*Sq + c[1,2,2,3]*Dr3 + c[1,2,3,3]*Ds3) 
+    T31_1 = -(sJI1) *(c[1,3,1,1]*Sq + c[1,3,2,1]*Dr3 + c[1,3,3,1]*Ds3) 
+    T32_1 = -(sJI1) *(c[1,3,1,2]*Sq + c[1,3,2,2]*Dr3 + c[1,3,3,2]*Ds3)
+    T33_1 = -(sJI1) *(c[1,3,1,3]*Sq + c[1,3,2,3]*Dr3 + c[1,3,3,3]*Ds3) 
+
+    T1 =   (T11_1, T12_1, T13_1, 
+            T21_1, T22_1, T23_1, 
+            T31_1, T32_1, T33_1) # grab these to send to RS terms
+    # FACE 2
+    # (Nq, Nr, Ns) = (1, 0, 0)
+    T11_2 = (sJI2) *(c[1,1,1,1]*Sq + c[1,1,2,1]*Dr3 + c[1,1,3,1]*Ds3)
+    T12_2 = (sJI2) *(c[1,1,1,2]*Sq + c[1,1,2,2]*Dr3 + c[1,1,3,2]*Ds3) 
+    T13_2 = (sJI2) *(c[1,1,1,3]*Sq + c[1,1,2,3]*Dr3 + c[1,1,3,3]*Ds3)
+    T21_2 = (sJI2) *(c[1,2,1,1]*Sq + c[1,2,2,1]*Dr3 + c[1,2,3,1]*Ds3)
+    T22_2 = (sJI2) *(c[1,2,1,2]*Sq + c[1,2,2,2]*Dr3 + c[1,2,3,2]*Ds3) 
+    T23_2 = (sJI2) *(c[1,2,1,3]*Sq + c[1,2,2,3]*Dr3 + c[1,2,3,3]*Ds3) 
+    T31_2 = (sJI2) *(c[1,3,1,1]*Sq + c[1,3,2,1]*Dr3 + c[1,3,3,1]*Ds3) 
+    T32_2 = (sJI2) *(c[1,3,1,2]*Sq + c[1,3,2,2]*Dr3 + c[1,3,3,2]*Ds3)
+    T33_2 = (sJI2) *(c[1,3,1,3]*Sq + c[1,3,2,3]*Dr3 + c[1,3,3,3]*Ds3) 
+
+    T2 =   (T11_2, T12_2, T13_2, 
+            T21_2, T22_2, T23_2, 
+            T31_2, T32_2, T33_2) # grab these to send to RS terms
+    
+    #   # FACE 3
+    #     # (Nq, Nr, Ns) = (0, -1, 0)
+    T11_3 = -(sJI3) *(c[2,1,1,1]*Dq3 + c[2,1,2,1]*Sr + c[2,1,3,1]*Ds3)
+    T12_3 = -(sJI3) *(c[2,1,1,2]*Dq3 + c[2,1,2,2]*Sr + c[2,1,3,2]*Ds3) 
+    T13_3 = -(sJI3) *(c[2,1,1,3]*Dq3 + c[2,1,2,3]*Sr + c[2,1,3,3]*Ds3)
+    T21_3 = -(sJI3) *(c[2,2,1,1]*Dq3 + c[2,2,2,1]*Sr + c[2,2,3,1]*Ds3)
+    T22_3 = -(sJI3) *(c[2,2,1,2]*Dq3 + c[2,2,2,2]*Sr + c[2,2,3,2]*Ds3) 
+    T23_3 = -(sJI3) *(c[2,2,1,3]*Dq3 + c[2,2,2,3]*Sr + c[2,2,3,3]*Ds3) 
+    T31_3 = -(sJI3) *(c[2,3,1,1]*Dq3 + c[2,3,2,1]*Sr + c[2,3,3,1]*Ds3) 
+    T32_3 = -(sJI3) *(c[2,3,1,2]*Dq3 + c[2,3,2,2]*Sr + c[2,3,3,2]*Ds3)
+    T33_3 = -(sJI3) *(c[2,3,1,3]*Dq3 + c[2,3,2,3]*Sr + c[2,3,3,3]*Ds3) 
+    
+    # FACE 4
+    # (Nq, Nr, Ns) = (0, 1, 0)
+    T11_4 = (sJI4) *(c[2,1,1,1]*Dq3 + c[2,1,2,1]*Sr + c[2,1,3,1]*Ds3)
+    T12_4 = (sJI4) *(c[2,1,1,2]*Dq3 + c[2,1,2,2]*Sr + c[2,1,3,2]*Ds3) 
+    T13_4 = (sJI4) *(c[2,1,1,3]*Dq3 + c[2,1,2,3]*Sr + c[2,1,3,3]*Ds3)
+    T21_4 = (sJI4) *(c[2,2,1,1]*Dq3 + c[2,2,2,1]*Sr + c[2,2,3,1]*Ds3)
+    T22_4 = (sJI4) *(c[2,2,1,2]*Dq3 + c[2,2,2,2]*Sr + c[2,2,3,2]*Ds3) 
+    T23_4 = (sJI4) *(c[2,2,1,3]*Dq3 + c[2,2,2,3]*Sr + c[2,2,3,3]*Ds3) 
+    T31_4 = (sJI4) *(c[2,3,1,1]*Dq3 + c[2,3,2,1]*Sr + c[2,3,3,1]*Ds3) 
+    T32_4 = (sJI4) *(c[2,3,1,2]*Dq3 + c[2,3,2,2]*Sr + c[2,3,3,2]*Ds3)
+    T33_4 = (sJI4) *(c[2,3,1,3]*Dq3 + c[2,3,2,3]*Sr + c[2,3,3,3]*Ds3)
+
+    # FACE 5
+    # (Nq, Nr, Ns) = (0, 0, -1)
+    T11_5 = -(sJI5) *(c[3,1,1,1]*Dq3 + c[3,1,2,1]*Dr3 + c[3,1,3,1]*Ss)
+    T12_5 = -(sJI5) *(c[3,1,1,2]*Dq3 + c[3,1,2,2]*Dr3 + c[3,1,3,2]*Ss)
+    T13_5 = -(sJI5) *(c[3,1,1,3]*Dq3 + c[3,1,2,3]*Dr3 + c[3,1,3,3]*Ss)
+    T21_5 = -(sJI5) *(c[3,2,1,1]*Dq3 + c[3,2,2,1]*Dr3 + c[3,2,3,1]*Ss)
+    T22_5 = -(sJI5) *(c[3,2,1,2]*Dq3 + c[3,2,2,2]*Dr3 + c[3,2,3,2]*Ss)
+    T23_5 = -(sJI5) *(c[3,2,1,3]*Dq3 + c[3,2,2,3]*Dr3 + c[3,2,3,3]*Ss)
+    T31_5 = -(sJI5) *(c[3,3,1,1]*Dq3 + c[3,3,2,1]*Dr3 + c[3,3,3,1]*Ss)
+    T32_5 = -(sJI5) *(c[3,3,1,2]*Dq3 + c[3,3,2,2]*Dr3 + c[3,3,3,2]*Ss)
+    T33_5 = -(sJI5) *(c[3,3,1,3]*Dq3 + c[3,3,2,3]*Dr3 + c[3,3,3,3]*Ss)
+
+    # FACE 6
+    # (Nq, Nr, Ns) = (0, 0, 1)
+    T11_6 = (sJI6) *(c[3,1,1,1]*Dq3 + c[3,1,2,1]*Dr3 + c[3,1,3,1]*Ss)
+    T12_6 = (sJI6) *(c[3,1,1,2]*Dq3 + c[3,1,2,2]*Dr3 + c[3,1,3,2]*Ss)
+    T13_6 = (sJI6) *(c[3,1,1,3]*Dq3 + c[3,1,2,3]*Dr3 + c[3,1,3,3]*Ss)
+    T21_6 = (sJI6) *(c[3,2,1,1]*Dq3 + c[3,2,2,1]*Dr3 + c[3,2,3,1]*Ss)
+    T22_6 = (sJI6) *(c[3,2,1,2]*Dq3 + c[3,2,2,2]*Dr3 + c[3,2,3,2]*Ss)
+    T23_6 = (sJI6) *(c[3,2,1,3]*Dq3 + c[3,2,2,3]*Dr3 + c[3,2,3,3]*Ss)
+    T31_6 = (sJI6) *(c[3,3,1,1]*Dq3 + c[3,3,2,1]*Dr3 + c[3,3,3,1]*Ss)
+    T32_6 = (sJI6) *(c[3,3,1,2]*Dq3 + c[3,3,2,2]*Dr3 + c[3,3,3,2]*Ss)
+    T33_6 = (sJI6) *(c[3,3,1,3]*Dq3 + c[3,3,2,3]*Dr3 + c[3,3,3,3]*Ss)
+
+    beta = 1
+    hq = Hq[1,1]; hr = Hr[1, 1]; hs = Hs[1,1];
+    d = 3
+    g = 1
+    
+    Z11_1 = (beta/hq) * d * (sJI1) *  (Nx1 * (c[1,1,1,1]*Nx1 + c[1,1,2,1]*Ny1 + c[1,1,3,1]*Nz1) + Ny1 * (c[2,1,1,1]*Nx1 + c[2,1,2,1]*Ny1 + c[2,1,3,1]*Nz1) + Nz1 * (c[3,1,1,1]*Nx1 + c[3,1,2,1]*Ny1 + c[3,1,3,1]*Nz1))
+    Z12_1 = (beta/hq) * d * (sJI1) *  (Nx1 * (c[1,1,1,2]*Nx1 + c[1,1,2,2]*Ny1 + c[1,1,3,2]*Nz1) + Ny1 * (c[2,1,1,2]*Nx1 + c[2,1,2,2]*Ny1 + c[2,1,3,2]*Nz1) + Nz1 * (c[3,1,1,2]*Nx1 + c[3,1,2,2]*Ny1 + c[3,1,3,2]*Nz1)) 
+    Z21_1 = (beta/hq) * d * (sJI1) *  (Nx1 * (c[1,2,1,1]*Nx1 + c[1,2,2,1]*Ny1 + c[1,2,3,1]*Nz1) + Ny1 * (c[2,2,1,1]*Nx1 + c[2,2,2,1]*Ny1 + c[2,2,3,1]*Nz1) + Nz1 * (c[3,2,1,1]*Nx1 + c[3,2,2,1]*Ny1 + c[3,2,3,1]*Nz1)) 
+    Z13_1 = (beta/hq) * d * (sJI1) *  (Nx1 * (c[1,1,1,3]*Nx1 + c[1,1,2,3]*Ny1 + c[1,1,3,3]*Nz1) + Ny1 * (c[2,1,1,3]*Nx1 + c[2,1,2,3]*Ny1 + c[2,1,3,3]*Nz1) + Nz1 * (c[3,1,1,3]*Nx1 + c[3,1,2,3]*Ny1 + c[3,1,3,3]*Nz1)) 
+    Z31_1 = (beta/hq) * d * (sJI1) *  (Nx1 * (c[1,3,1,1]*Nx1 + c[1,3,2,1]*Ny1 + c[1,3,3,1]*Nz1) + Ny1 * (c[2,3,1,1]*Nx1 + c[2,3,2,1]*Ny1 + c[2,3,3,1]*Nz1) + Nz1 * (c[3,3,1,1]*Nx1 + c[3,3,2,1]*Ny1 + c[3,3,3,1]*Nz1)) 
+    Z22_1 = (beta/hq) * d * (sJI1) *  (Nx1 * (c[1,2,1,2]*Nx1 + c[1,2,2,2]*Ny1 + c[1,2,3,2]*Nz1) + Ny1 * (c[2,2,1,2]*Nx1 + c[2,2,2,2]*Ny1 + c[2,2,3,2]*Nz1) + Nz1 * (c[3,2,1,2]*Nx1 + c[3,2,2,2]*Ny1 + c[3,2,3,2]*Nz1)) 
+    Z23_1 = (beta/hq) * d * (sJI1) *  (Nx1 * (c[1,2,1,3]*Nx1 + c[1,2,2,3]*Ny1 + c[1,2,3,3]*Nz1) + Ny1 * (c[2,2,1,3]*Nx1 + c[2,2,2,3]*Ny1 + c[2,2,3,3]*Nz1) + Nz1 * (c[3,2,1,3]*Nx1 + c[3,2,2,3]*Ny1 + c[3,2,3,3]*Nz1)) 
+    Z32_1 = (beta/hq) * d * (sJI1) *  (Nx1 * (c[1,3,1,2]*Nx1 + c[1,3,2,2]*Ny1 + c[1,3,3,2]*Nz1) + Ny1 * (c[2,3,1,2]*Nx1 + c[2,3,2,2]*Ny1 + c[2,3,3,2]*Nz1) + Nz1 * (c[3,3,1,2]*Nx1 + c[3,3,2,2]*Ny1 + c[3,3,3,2]*Nz1)) 
+    Z33_1 = (beta/hq) * d * (sJI1) *  (Nx1 * (c[1,3,1,3]*Nx1 + c[1,3,2,3]*Ny1 + c[1,3,3,3]*Nz1) + Ny1 * (c[2,3,1,3]*Nx1 + c[2,3,2,3]*Ny1 + c[2,3,3,3]*Nz1) + Nz1 * (c[3,3,1,3]*Nx1 + c[3,3,2,3]*Ny1 + c[3,3,3,3]*Nz1)) 
+
+    Z1 = (Z11_1, Z12_1, Z13_1,
+          Z21_1, Z22_1, Z23_1,
+          Z31_1, Z32_1, Z33_1)
+    
+    Z11_2 = (beta/hq) * d * (sJI2) * (Nx2 * (c[1,1,1,1]*Nx2 + c[1,1,2,1]*Ny2 + c[1,1,3,1]*Nz2) + Ny2 * (c[2,1,1,1]*Nx2 + c[2,1,2,1]*Ny2 + c[2,1,3,1]*Nz2) + Nz2 * (c[3,1,1,1]*Nx2 + c[3,1,2,1]*Ny2 + c[3,1,3,1]*Nz2)) 
+    Z12_2 = (beta/hq) * d * (sJI2) * (Nx2 * (c[1,1,1,2]*Nx2 + c[1,1,2,2]*Ny2 + c[1,1,3,2]*Nz2) + Ny2 * (c[2,1,1,2]*Nx2 + c[2,1,2,2]*Ny2 + c[2,1,3,2]*Nz2) + Nz2 * (c[3,1,1,2]*Nx2 + c[3,1,2,2]*Ny2 + c[3,1,3,2]*Nz2)) 
+    Z21_2 = (beta/hq) * d * (sJI2) * (Nx2 * (c[1,2,1,1]*Nx2 + c[1,2,2,1]*Ny2 + c[1,2,3,1]*Nz2) + Ny2 * (c[2,2,1,1]*Nx2 + c[2,2,2,1]*Ny2 + c[2,2,3,1]*Nz2) + Nz2 * (c[3,2,1,1]*Nx2 + c[3,2,2,1]*Ny2 + c[3,2,3,1]*Nz2)) 
+    Z13_2 = (beta/hq) * d * (sJI2) *  (Nx2 * (c[1,1,1,3]*Nx2 + c[1,1,2,3]*Ny2 + c[1,1,3,3]*Nz2) + Ny2 * (c[2,1,1,3]*Nx2 + c[2,1,2,3]*Ny2 + c[2,1,3,3]*Nz2) + Nz2 * (c[3,1,1,3]*Nx2 + c[3,1,2,3]*Ny2 + c[3,1,3,3]*Nz2)) 
+    Z31_2 = (beta/hq) * d * (sJI2) *  (Nx2 * (c[1,3,1,1]*Nx2 + c[1,3,2,1]*Ny2 + c[1,3,3,1]*Nz2) + Ny2 * (c[2,3,1,1]*Nx2 + c[2,3,2,1]*Ny2 + c[2,3,3,1]*Nz2) + Nz2 * (c[3,3,1,1]*Nx2 + c[3,3,2,1]*Ny2 + c[3,3,3,1]*Nz2)) 
+    Z22_2 = (beta/hq) * d * (sJI2) *  (Nx2 * (c[1,2,1,2]*Nx2 + c[1,2,2,2]*Ny2 + c[1,2,3,2]*Nz2) + Ny2 * (c[2,2,1,2]*Nx2 + c[2,2,2,2]*Ny2 + c[2,2,3,2]*Nz2) + Nz2 * (c[3,2,1,2]*Nx2 + c[3,2,2,2]*Ny2 + c[3,2,3,2]*Nz2)) 
+    Z23_2 = (beta/hq) * d * (sJI2) *  (Nx2 * (c[1,2,1,3]*Nx2 + c[1,2,2,3]*Ny2 + c[1,2,3,3]*Nz2) + Ny2 * (c[2,2,1,3]*Nx2 + c[2,2,2,3]*Ny2 + c[2,2,3,3]*Nz2) + Nz2 * (c[3,2,1,3]*Nx2 + c[3,2,2,3]*Ny2 + c[3,2,3,3]*Nz2)) 
+    Z32_2 = (beta/hq) * d * (sJI2) *  (Nx2 * (c[1,3,1,2]*Nx2 + c[1,3,2,2]*Ny2 + c[1,3,3,2]*Nz2) + Ny2 * (c[2,3,1,2]*Nx2 + c[2,3,2,2]*Ny2 + c[2,3,3,2]*Nz2) + Nz2 * (c[3,3,1,2]*Nx2 + c[3,3,2,2]*Ny2 + c[3,3,3,2]*Nz2)) 
+    Z33_2 = (beta/hq) * d * (sJI2) *  (Nx2 * (c[1,3,1,3]*Nx2 + c[1,3,2,3]*Ny2 + c[1,3,3,3]*Nz2) + Ny2 * (c[2,3,1,3]*Nx2 + c[2,3,2,3]*Ny2 + c[2,3,3,3]*Nz2) + Nz2 * (c[3,3,1,3]*Nx2 + c[3,3,2,3]*Ny2 + c[3,3,3,3]*Nz2)) 
+    
+    Z2 = (Z11_2, Z12_2, Z13_2,
+          Z21_2, Z22_2, Z23_2,
+          Z31_2, Z32_2, Z33_2)
+
+     # FACE 3 
+    # (nq, nr, ns) = (0, -1, 0)
+    Z11_3 = (beta/hr) * d * (sJI3) * (Nx3 * (c[1,1,1,1]*Nx3 + c[1,1,2,1]*Ny3 + c[1,1,3,1]*Nz3) + Ny3 * (c[2,1,1,1]*Nx3 + c[2,1,2,1]*Ny3 + c[2,1,3,1]*Nz3) + Nz3 * (c[3,1,1,1]*Nx3 + c[3,1,2,1]*Ny3 + c[3,1,3,1]*Nz3)) 
+    Z12_3 = (beta/hr) * d * (sJI3) * (Nx3 * (c[1,1,1,2]*Nx3 + c[1,1,2,2]*Ny3 + c[1,1,3,2]*Nz3) + Ny3 * (c[2,1,1,2]*Nx3 + c[2,1,2,2]*Ny3 + c[2,1,3,2]*Nz3) + Nz3 * (c[3,1,1,2]*Nx3 + c[3,1,2,2]*Ny3 + c[3,1,3,2]*Nz3)) 
+    Z21_3 = (beta/hr) * d * (sJI3) * (Nx3 * (c[1,2,1,1]*Nx3 + c[1,2,2,1]*Ny3 + c[1,2,3,1]*Nz3) + Ny3 * (c[2,2,1,1]*Nx3 + c[2,2,2,1]*Ny3 + c[2,2,3,1]*Nz3) + Nz3 * (c[3,2,1,1]*Nx3 + c[3,2,2,1]*Ny3 + c[3,2,3,1]*Nz3)) 
+    Z13_3 = (beta/hr) * d * (sJI3) * (Nx3 * (c[1,1,1,3]*Nx3 + c[1,1,2,3]*Ny3 + c[1,1,3,3]*Nz3) + Ny3 * (c[2,1,1,3]*Nx3 + c[2,1,2,3]*Ny3 + c[2,1,3,3]*Nz3) + Nz3 * (c[3,1,1,3]*Nx3 + c[3,1,2,3]*Ny3 + c[3,1,3,3]*Nz3)) 
+    Z31_3 = (beta/hr) * d * (sJI3) * (Nx3 * (c[1,3,1,1]*Nx3 + c[1,3,2,1]*Ny3 + c[1,3,3,1]*Nz3) + Ny3 * (c[2,3,1,1]*Nx3 + c[2,3,2,1]*Ny3 + c[2,3,3,1]*Nz3) + Nz3 * (c[3,3,1,1]*Nx3 + c[3,3,2,1]*Ny3 + c[3,3,3,1]*Nz3)) 
+    Z22_3 = (beta/hr) * d * (sJI3) * (Nx3 * (c[1,2,1,2]*Nx3 + c[1,2,2,2]*Ny3 + c[1,2,3,2]*Nz3) + Ny3 * (c[2,2,1,2]*Nx3 + c[2,2,2,2]*Ny3 + c[2,2,3,2]*Nz3) + Nz3 * (c[3,2,1,2]*Nx3 + c[3,2,2,2]*Ny3 + c[3,2,3,2]*Nz3)) 
+    Z23_3 = (beta/hr) * d * (sJI3) * (Nx3 * (c[1,2,1,3]*Nx3 + c[1,2,2,3]*Ny3 + c[1,2,3,3]*Nz3) + Ny3 * (c[2,2,1,3]*Nx3 + c[2,2,2,3]*Ny3 + c[2,2,3,3]*Nz3) + Nz3 * (c[3,2,1,3]*Nx3 + c[3,2,2,3]*Ny3 + c[3,2,3,3]*Nz3)) 
+    Z32_3 = (beta/hr) * d * (sJI3) * (Nx3 * (c[1,3,1,2]*Nx3 + c[1,3,2,2]*Ny3 + c[1,3,3,2]*Nz3) + Ny3 * (c[2,3,1,2]*Nx3 + c[2,3,2,2]*Ny3 + c[2,3,3,2]*Nz3) + Nz3 * (c[3,3,1,2]*Nx3 + c[3,3,2,2]*Ny3 + c[3,3,3,2]*Nz3)) 
+    Z33_3 = (beta/hr) * d * (sJI3) * (Nx3 * (c[1,3,1,3]*Nx3 + c[1,3,2,3]*Ny3 + c[1,3,3,3]*Nz3) + Ny3 * (c[2,3,1,3]*Nx3 + c[2,3,2,3]*Ny3 + c[2,3,3,3]*Nz3) + Nz3 * (c[3,3,1,3]*Nx3 + c[3,3,2,3]*Ny3 + c[3,3,3,3]*Nz3)) 
+
+   # FACE 4 
+    # (nq, nr, ns) = (0, 1, 0)
+    Z11_4 = (beta/hr) * d * (sJI4) * (Nx4 * (c[1,1,1,1]*Nx4 + c[1,1,2,1]*Ny4 + c[1,1,3,1]*Nz4) + Ny4 * (c[2,1,1,1]*Nx4 + c[2,1,2,1]*Ny4 + c[2,1,3,1]*Nz4) + Nz4 * (c[3,1,1,1]*Nx4 + c[3,1,2,1]*Ny4 + c[3,1,3,1]*Nz4)) 
+    Z12_4 = (beta/hr) * d * (sJI4) * (Nx4 * (c[1,1,1,2]*Nx4 + c[1,1,2,2]*Ny4 + c[1,1,3,2]*Nz4) + Ny4 * (c[2,1,1,2]*Nx4 + c[2,1,2,2]*Ny4 + c[2,1,3,2]*Nz4) + Nz4 * (c[3,1,1,2]*Nx4 + c[3,1,2,2]*Ny4 + c[3,1,3,2]*Nz4)) 
+    Z21_4 = (beta/hr) * d * (sJI4) * (Nx4 * (c[1,2,1,1]*Nx4 + c[1,2,2,1]*Ny4 + c[1,2,3,1]*Nz4) + Ny4 * (c[2,2,1,1]*Nx4 + c[2,2,2,1]*Ny4 + c[2,2,3,1]*Nz4) + Nz4 * (c[3,2,1,1]*Nx4 + c[3,2,2,1]*Ny4 + c[3,2,3,1]*Nz4)) 
+    Z13_4 = (beta/hr) * d * (sJI4) * (Nx4 * (c[1,1,1,3]*Nx4 + c[1,1,2,3]*Ny4 + c[1,1,3,3]*Nz4) + Ny4 * (c[2,1,1,3]*Nx4 + c[2,1,2,3]*Ny4 + c[2,1,3,3]*Nz4) + Nz4 * (c[3,1,1,3]*Nx4 + c[3,1,2,3]*Ny4 + c[3,1,3,3]*Nz4)) 
+    Z31_4 = (beta/hr) * d * (sJI4) * (Nx4 * (c[1,3,1,1]*Nx4 + c[1,3,2,1]*Ny4 + c[1,3,3,1]*Nz4) + Ny4 * (c[2,3,1,1]*Nx4 + c[2,3,2,1]*Ny4 + c[2,3,3,1]*Nz4) + Nz4 * (c[3,3,1,1]*Nx4 + c[3,3,2,1]*Ny4 + c[3,3,3,1]*Nz4)) 
+    Z22_4 = (beta/hr) * d * (sJI4) * (Nx4 * (c[1,2,1,2]*Nx4 + c[1,2,2,2]*Ny4 + c[1,2,3,2]*Nz4) + Ny4 * (c[2,2,1,2]*Nx4 + c[2,2,2,2]*Ny4 + c[2,2,3,2]*Nz4) + Nz4 * (c[3,2,1,2]*Nx4 + c[3,2,2,2]*Ny4 + c[3,2,3,2]*Nz4)) 
+    Z23_4 = (beta/hr) * d * (sJI4) * (Nx4 * (c[1,2,1,3]*Nx4 + c[1,2,2,3]*Ny4 + c[1,2,3,3]*Nz4) + Ny4 * (c[2,2,1,3]*Nx4 + c[2,2,2,3]*Ny4 + c[2,2,3,3]*Nz4) + Nz4 * (c[3,2,1,3]*Nx4 + c[3,2,2,3]*Ny4 + c[3,2,3,3]*Nz4)) 
+    Z32_4 = (beta/hr) * d * (sJI4) * (Nx4 * (c[1,3,1,2]*Nx4 + c[1,3,2,2]*Ny4 + c[1,3,3,2]*Nz4) + Ny4 * (c[2,3,1,2]*Nx4 + c[2,3,2,2]*Ny4 + c[2,3,3,2]*Nz4) + Nz4 * (c[3,3,1,2]*Nx4 + c[3,3,2,2]*Ny4 + c[3,3,3,2]*Nz4)) 
+    Z33_4 = (beta/hr) * d * (sJI4) * (Nx4 * (c[1,3,1,3]*Nx4 + c[1,3,2,3]*Ny4 + c[1,3,3,3]*Nz4) + Ny4 * (c[2,3,1,3]*Nx4 + c[2,3,2,3]*Ny4 + c[2,3,3,3]*Nz4) + Nz4 * (c[3,3,1,3]*Nx4 + c[3,3,2,3]*Ny4 + c[3,3,3,3]*Nz4)) 
+
+    # FACE 5 
+    # (nq, nr, ns) = (0, 0, -1)
+    Z11_5 = (beta/hs) * d * (sJI5) * (Nx5 * (c[1,1,1,1]*Nx5 + c[1,1,2,1]*Ny5 + c[1,1,3,1]*Nz5) + Ny5 * (c[2,1,1,1]*Nx5 + c[2,1,2,1]*Ny5 + c[2,1,3,1]*Nz5) + Nz5 * (c[3,1,1,1]*Nx5 + c[3,1,2,1]*Ny5 + c[3,1,3,1]*Nz5)) 
+    Z12_5 = (beta/hs) * d * (sJI5) * (Nx5 * (c[1,1,1,2]*Nx5 + c[1,1,2,2]*Ny5 + c[1,1,3,2]*Nz5) + Ny5 * (c[2,1,1,2]*Nx5 + c[2,1,2,2]*Ny5 + c[2,1,3,2]*Nz5) + Nz5 * (c[3,1,1,2]*Nx5 + c[3,1,2,2]*Ny5 + c[3,1,3,2]*Nz5)) 
+    Z21_5 = (beta/hs) * d * (sJI5) * (Nx5 * (c[1,2,1,1]*Nx5 + c[1,2,2,1]*Ny5 + c[1,2,3,1]*Nz5) + Ny5 * (c[2,2,1,1]*Nx5 + c[2,2,2,1]*Ny5 + c[2,2,3,1]*Nz5) + Nz5 * (c[3,2,1,1]*Nx5 + c[3,2,2,1]*Ny5 + c[3,2,3,1]*Nz5)) 
+    Z13_5 = (beta/hs) * d * (sJI5) * (Nx5 * (c[1,1,1,3]*Nx5 + c[1,1,2,3]*Ny5 + c[1,1,3,3]*Nz5) + Ny5 * (c[2,1,1,3]*Nx5 + c[2,1,2,3]*Ny5 + c[2,1,3,3]*Nz5) + Nz5 * (c[3,1,1,3]*Nx5 + c[3,1,2,3]*Ny5 + c[3,1,3,3]*Nz5)) 
+    Z31_5 = (beta/hs) * d * (sJI5) * (Nx5 * (c[1,3,1,1]*Nx5 + c[1,3,2,1]*Ny5 + c[1,3,3,1]*Nz5) + Ny5 * (c[2,3,1,1]*Nx5 + c[2,3,2,1]*Ny5 + c[2,3,3,1]*Nz5) + Nz5 * (c[3,3,1,1]*Nx5 + c[3,3,2,1]*Ny5 + c[3,3,3,1]*Nz5)) 
+    Z22_5 = (beta/hs) * d * (sJI5) * (Nx5 * (c[1,2,1,2]*Nx5 + c[1,2,2,2]*Ny5 + c[1,2,3,2]*Nz5) + Ny5 * (c[2,2,1,2]*Nx5 + c[2,2,2,2]*Ny5 + c[2,2,3,2]*Nz5) + Nz5 * (c[3,2,1,2]*Nx5 + c[3,2,2,2]*Ny5 + c[3,2,3,2]*Nz5)) 
+    Z23_5 = (beta/hs) * d * (sJI5) * (Nx5 * (c[1,2,1,3]*Nx5 + c[1,2,2,3]*Ny5 + c[1,2,3,3]*Nz5) + Ny5 * (c[2,2,1,3]*Nx5 + c[2,2,2,3]*Ny5 + c[2,2,3,3]*Nz5) + Nz5 * (c[3,2,1,3]*Nx5 + c[3,2,2,3]*Ny5 + c[3,2,3,3]*Nz5)) 
+    Z32_5 = (beta/hs) * d * (sJI5) * (Nx5 * (c[1,3,1,2]*Nx5 + c[1,3,2,2]*Ny5 + c[1,3,3,2]*Nz5) + Ny5 * (c[2,3,1,2]*Nx5 + c[2,3,2,2]*Ny5 + c[2,3,3,2]*Nz5) + Nz5 * (c[3,3,1,2]*Nx5 + c[3,3,2,2]*Ny5 + c[3,3,3,2]*Nz5)) 
+    Z33_5 = (beta/hs) * d * (sJI5) * (Nx5 * (c[1,3,1,3]*Nx5 + c[1,3,2,3]*Ny5 + c[1,3,3,3]*Nz5) + Ny5 * (c[2,3,1,3]*Nx5 + c[2,3,2,3]*Ny5 + c[2,3,3,3]*Nz5) + Nz5 * (c[3,3,1,3]*Nx5 + c[3,3,2,3]*Ny5 + c[3,3,3,3]*Nz5)) 
+
+    # FACE 6 
+    # (nq, nr, ns) = (0, 0, 1)
+    Z11_6 = (beta/hs) * d * (sJI6) * (Nx6 * (c[1,1,1,1]*Nx6 + c[1,1,2,1]*Ny6 + c[1,1,3,1]*Nz6) + Ny6 * (c[2,1,1,1]*Nx6 + c[2,1,2,1]*Ny6 + c[2,1,3,1]*Nz6) + Nz6 * (c[3,1,1,1]*Nx6 + c[3,1,2,1]*Ny6 + c[3,1,3,1]*Nz6)) 
+    Z12_6 = (beta/hs) * d * (sJI6) * (Nx6 * (c[1,1,1,2]*Nx6 + c[1,1,2,2]*Ny6 + c[1,1,3,2]*Nz6) + Ny6 * (c[2,1,1,2]*Nx6 + c[2,1,2,2]*Ny6 + c[2,1,3,2]*Nz6) + Nz6 * (c[3,1,1,2]*Nx6 + c[3,1,2,2]*Ny6 + c[3,1,3,2]*Nz6)) 
+    Z21_6 = (beta/hs) * d * (sJI6) * (Nx6 * (c[1,2,1,1]*Nx6 + c[1,2,2,1]*Ny6 + c[1,2,3,1]*Nz6) + Ny6 * (c[2,2,1,1]*Nx6 + c[2,2,2,1]*Ny6 + c[2,2,3,1]*Nz6) + Nz6 * (c[3,2,1,1]*Nx6 + c[3,2,2,1]*Ny6 + c[3,2,3,1]*Nz6)) 
+    Z13_6 = (beta/hs) * d * (sJI6) * (Nx6 * (c[1,1,1,3]*Nx6 + c[1,1,2,3]*Ny6 + c[1,1,3,3]*Nz6) + Ny6 * (c[2,1,1,3]*Nx6 + c[2,1,2,3]*Ny6 + c[2,1,3,3]*Nz6) + Nz6 * (c[3,1,1,3]*Nx6 + c[3,1,2,3]*Ny6 + c[3,1,3,3]*Nz6)) 
+    Z31_6 = (beta/hs) * d * (sJI6) * (Nx6 * (c[1,3,1,1]*Nx6 + c[1,3,2,1]*Ny6 + c[1,3,3,1]*Nz6) + Ny6 * (c[2,3,1,1]*Nx6 + c[2,3,2,1]*Ny6 + c[2,3,3,1]*Nz6) + Nz6 * (c[3,3,1,1]*Nx6 + c[3,3,2,1]*Ny6 + c[3,3,3,1]*Nz6)) 
+    Z22_6 = (beta/hs) * d * (sJI6) * (Nx6 * (c[1,2,1,2]*Nx6 + c[1,2,2,2]*Ny6 + c[1,2,3,2]*Nz6) + Ny6 * (c[2,2,1,2]*Nx6 + c[2,2,2,2]*Ny6 + c[2,2,3,2]*Nz6) + Nz6 * (c[3,2,1,2]*Nx6 + c[3,2,2,2]*Ny6 + c[3,2,3,2]*Nz6)) 
+    Z23_6 = (beta/hs) * d * (sJI6) * (Nx6 * (c[1,2,1,3]*Nx6 + c[1,2,2,3]*Ny6 + c[1,2,3,3]*Nz6) + Ny6 * (c[2,2,1,3]*Nx6 + c[2,2,2,3]*Ny6 + c[2,2,3,3]*Nz6) + Nz6 * (c[3,2,1,3]*Nx6 + c[3,2,2,3]*Ny6 + c[3,2,3,3]*Nz6)) 
+    Z32_6 = (beta/hs) * d * (sJI6) * (Nx6 * (c[1,3,1,2]*Nx6 + c[1,3,2,2]*Ny6 + c[1,3,3,2]*Nz6) + Ny6 * (c[2,3,1,2]*Nx6 + c[2,3,2,2]*Ny6 + c[2,3,3,2]*Nz6) + Nz6 * (c[3,3,1,2]*Nx6 + c[3,3,2,2]*Ny6 + c[3,3,3,2]*Nz6)) 
+    Z33_6 = (beta/hs) * d * (sJI6) * (Nx6 * (c[1,3,1,3]*Nx6 + c[1,3,2,3]*Ny6 + c[1,3,3,3]*Nz6) + Ny6 * (c[2,3,1,3]*Nx6 + c[2,3,2,3]*Ny6 + c[2,3,3,3]*Nz6) + Nz6 * (c[3,3,1,3]*Nx6 + c[3,3,2,3]*Ny6 + c[3,3,3,3]*Nz6)) 
+    
+    n = 1 #default to n = 1
+
+    e = ((e1, e1T), (e2, e2T), (e3, e3T), (e4, e4T), (e5, e5T), (e6, e6T))  
+
+    # Create SAT vectors: Allocate above to make this easier with interface
+    S11 = spzeros(size(A11)); S12 = spzeros(size(A12)); S13 = spzeros(size(A13)); 
+    S21 = spzeros(size(A21)); S22 = spzeros(size(A22)); S23 = spzeros(size(A23)); 
+    S31 = spzeros(size(A31)); S32 = spzeros(size(A32)); S33 = spzeros(size(A33)); 
+
+    T = (T1, T2) # maybe fill in other faces eventually 
+
+    lift_f1 = e1*sJ1*H1
+    lift_f2 = e2*sJ2*H2
+    lift_f3 = e3*sJ3*H3
+    lift_f4 = e4*sJ4*H4
+    lift_f5 = e5*sJ5*H5
+    lift_f6 = e6*sJ6*H6
+
+    Hn = -1.0*H;
+
+    if mode == "default"
+
+        if !interface # Dirichlet on all side  \/
+
+            S11 .=  JHI * ((T11_1 .- Z11_1)'*e1*sJ1*H1*e1T + (T11_2 .- Z11_2)'*e2*sJ2*H2*e2T + (T11_3 .- Z11_3)'*e3*sJ3*H3*e3T + (T11_4 .- Z11_4)'*e4*sJ4*H4*e4T + (T11_5 .- Z11_5)'*e5*sJ5*H5*e5T + (T11_6 .- Z11_6)'*e6*sJ6*H6*e6T)
+            S12 .=  JHI * ((T21_1 .- Z21_1)'*e1*sJ1*H1*e1T + (T21_2 .- Z21_2)'*e2*sJ2*H2*e2T + (T21_3 .- Z21_3)'*e3*sJ3*H3*e3T + (T21_4 .- Z21_4)'*e4*sJ4*H4*e4T + (T21_5 .- Z21_5)'*e5*sJ5*H5*e5T + (T21_6 .- Z21_6)'*e6*sJ6*H6*e6T)    
+            S13 .=  JHI * ((T31_1 .- Z31_1)'*e1*sJ1*H1*e1T + (T31_2 .- Z31_2)'*e2*sJ2*H2*e2T + (T31_3 .- Z31_3)'*e3*sJ3*H3*e3T + (T31_4 .- Z31_4)'*e4*sJ4*H4*e4T + (T31_5 .- Z31_5)'*e5*sJ5*H5*e5T + (T31_6 .- Z31_6)'*e6*sJ6*H6*e6T)
+
+            S21 .=  JHI * ((T12_1 .- Z12_1)'*e1*sJ1*H1*e1T + (T12_2 .- Z12_2)'*e2*sJ2*H2*e2T + (T12_3 .- Z12_3)'*e3*sJ3*H3*e3T + (T12_4 .- Z12_4)'*e4*sJ4*H4*e4T + (T12_5 .- Z12_5)'*e5*sJ5*H5*e5T + (T12_6 .- Z12_6)'*e6*sJ6*H6*e6T)
+            S22 .=  JHI * ((T22_1 .- Z22_1)'*e1*sJ1*H1*e1T + (T22_2 .- Z22_2)'*e2*sJ2*H2*e2T + (T22_3 .- Z22_3)'*e3*sJ3*H3*e3T + (T22_4 .- Z22_4)'*e4*sJ4*H4*e4T + (T22_5 .- Z22_5)'*e5*sJ5*H5*e5T + (T22_6 .- Z22_6)'*e6*sJ6*H6*e6T)    
+            S23 .=  JHI * ((T32_1 .- Z32_1)'*e1*sJ1*H1*e1T + (T32_2 .- Z32_2)'*e2*sJ2*H2*e2T + (T32_3 .- Z32_3)'*e3*sJ3*H3*e3T + (T32_4 .- Z32_4)'*e4*sJ4*H4*e4T + (T32_5 .- Z32_5)'*e5*sJ5*H5*e5T + (T32_6 .- Z32_6)'*e6*sJ6*H6*e6T)
+
+            S31 .=  JHI * ((T13_1 .- Z13_1)'*e1*sJ1*H1*e1T + (T13_2 .- Z13_2)'*e2*sJ2*H2*e2T + (T13_3 .- Z13_3)'*e3*sJ3*H3*e3T + (T13_4 .- Z13_4)'*e4*sJ4*H4*e4T + (T13_5 .- Z13_5)'*e5*sJ5*H5*e5T + (T13_6 .- Z13_6)'*e6*sJ6*H6*e6T)
+            S32 .=  JHI * ((T23_1 .- Z23_1)'*e1*sJ1*H1*e1T + (T23_2 .- Z23_2)'*e2*sJ2*H2*e2T + (T23_3 .- Z23_3)'*e3*sJ3*H3*e3T + (T23_4 .- Z23_4)'*e4*sJ4*H4*e4T + (T23_5 .- Z23_5)'*e5*sJ5*H5*e5T + (T23_6 .- Z23_6)'*e6*sJ6*H6*e6T)    
+            S33 .=  JHI * ((T33_1 .- Z33_1)'*e1*sJ1*H1*e1T + (T33_2 .- Z33_2)'*e2*sJ2*H2*e2T + (T33_3 .- Z33_3)'*e3*sJ3*H3*e3T + (T33_4 .- Z33_4)'*e4*sJ4*H4*e4T + (T33_5 .- Z33_5)'*e5*sJ5*H5*e5T + (T33_6 .- Z33_6)'*e6*sJ6*H6*e6T)
+        
+        else    # We add an interface
+                # Just remove interface side from SAT terms, we account for interfaces in another function
+            if int_side == 1
+                S11 .=  JHI * ((T11_2 .- Z11_2)'*e2*sJ2*H2*e2T + (T11_3 .- Z11_3)'*e3*sJ3*H3*e3T + (T11_4 .- Z11_4)'*e4*sJ4*H4*e4T + (T11_5 .- Z11_5)'*e5*sJ5*H5*e5T + (T11_6 .- Z11_6)'*e6*sJ6*H6*e6T)
+                S12 .=  JHI * ((T21_2 .- Z21_2)'*e2*sJ2*H2*e2T + (T21_3 .- Z21_3)'*e3*sJ3*H3*e3T + (T21_4 .- Z21_4)'*e4*sJ4*H4*e4T + (T21_5 .- Z21_5)'*e5*sJ5*H5*e5T + (T21_6 .- Z21_6)'*e6*sJ6*H6*e6T)    
+                S13 .=  JHI * ((T31_2 .- Z31_2)'*e2*sJ2*H2*e2T + (T31_3 .- Z31_3)'*e3*sJ3*H3*e3T + (T31_4 .- Z31_4)'*e4*sJ4*H4*e4T + (T31_5 .- Z31_5)'*e5*sJ5*H5*e5T + (T31_6 .- Z31_6)'*e6*sJ6*H6*e6T)
+
+                S21 .=  JHI * ((T12_2 .- Z12_2)'*e2*sJ2*H2*e2T + (T12_3 .- Z12_3)'*e3*sJ3*H3*e3T + (T12_4 .- Z12_4)'*e4*sJ4*H4*e4T + (T12_5 .- Z12_5)'*e5*sJ5*H5*e5T + (T12_6 .- Z12_6)'*e6*sJ6*H6*e6T)
+                S22 .=  JHI * ((T22_2 .- Z22_2)'*e2*sJ2*H2*e2T + (T22_3 .- Z22_3)'*e3*sJ3*H3*e3T + (T22_4 .- Z22_4)'*e4*sJ4*H4*e4T + (T22_5 .- Z22_5)'*e5*sJ5*H5*e5T + (T22_6 .- Z22_6)'*e6*sJ6*H6*e6T)    
+                S23 .=  JHI * ((T32_2 .- Z32_2)'*e2*sJ2*H2*e2T + (T32_3 .- Z32_3)'*e3*sJ3*H3*e3T + (T32_4 .- Z32_4)'*e4*sJ4*H4*e4T + (T32_5 .- Z32_5)'*e5*sJ5*H5*e5T + (T32_6 .- Z32_6)'*e6*sJ6*H6*e6T)
+
+                S31 .=  JHI * ((T13_2 .- Z13_2)'*e2*sJ2*H2*e2T + (T13_3 .- Z13_3)'*e3*sJ3*H3*e3T + (T13_4 .- Z13_4)'*e4*sJ4*H4*e4T + (T13_5 .- Z13_5)'*e5*sJ5*H5*e5T + (T13_6 .- Z13_6)'*e6*sJ6*H6*e6T)
+                S32 .=  JHI * ((T23_2 .- Z23_2)'*e2*sJ2*H2*e2T + (T23_3 .- Z23_3)'*e3*sJ3*H3*e3T + (T23_4 .- Z23_4)'*e4*sJ4*H4*e4T + (T23_5 .- Z23_5)'*e5*sJ5*H5*e5T + (T23_6 .- Z23_6)'*e6*sJ6*H6*e6T)    
+                S33 .=  JHI * ((T33_2 .- Z33_2)'*e2*sJ2*H2*e2T + (T33_3 .- Z33_3)'*e3*sJ3*H3*e3T + (T33_4 .- Z33_4)'*e4*sJ4*H4*e4T + (T33_5 .- Z33_5)'*e5*sJ5*H5*e5T + (T33_6 .- Z33_6)'*e6*sJ6*H6*e6T)
+            elseif int_side == 2
+
+                S11 .=  JHI * ((T11_1 .- Z11_1)'*e1*sJ1*H1*e1T + (T11_3 .- Z11_3)'*e3*sJ3*H3*e3T + (T11_4 .- Z11_4)'*e4*sJ4*H4*e4T + (T11_5 .- Z11_5)'*e5*sJ5*H5*e5T + (T11_6 .- Z11_6)'*e6*sJ6*H6*e6T)
+                S12 .=  JHI * ((T21_1 .- Z21_1)'*e1*sJ1*H1*e1T + (T21_3 .- Z21_3)'*e3*sJ3*H3*e3T + (T21_4 .- Z21_4)'*e4*sJ4*H4*e4T + (T21_5 .- Z21_5)'*e5*sJ5*H5*e5T + (T21_6 .- Z21_6)'*e6*sJ6*H6*e6T)    
+                S13 .=  JHI * ((T31_1 .- Z31_1)'*e1*sJ1*H1*e1T + (T31_3 .- Z31_3)'*e3*sJ3*H3*e3T + (T31_4 .- Z31_4)'*e4*sJ4*H4*e4T + (T31_5 .- Z31_5)'*e5*sJ5*H5*e5T + (T31_6 .- Z31_6)'*e6*sJ6*H6*e6T)
+
+                S21 .=  JHI * ((T12_1 .- Z12_1)'*e1*sJ1*H1*e1T + (T12_3 .- Z12_3)'*e3*sJ3*H3*e3T + (T12_4 .- Z12_4)'*e4*sJ4*H4*e4T + (T12_5 .- Z12_5)'*e5*sJ5*H5*e5T + (T12_6 .- Z12_6)'*e6*sJ6*H6*e6T)
+                S22 .=  JHI * ((T22_1 .- Z22_1)'*e1*sJ1*H1*e1T + (T22_3 .- Z22_3)'*e3*sJ3*H3*e3T + (T22_4 .- Z22_4)'*e4*sJ4*H4*e4T + (T22_5 .- Z22_5)'*e5*sJ5*H5*e5T + (T22_6 .- Z22_6)'*e6*sJ6*H6*e6T)    
+                S23 .=  JHI * ((T32_1 .- Z32_1)'*e1*sJ1*H1*e1T + (T32_3 .- Z32_3)'*e3*sJ3*H3*e3T + (T32_4 .- Z32_4)'*e4*sJ4*H4*e4T + (T32_5 .- Z32_5)'*e5*sJ5*H5*e5T + (T32_6 .- Z32_6)'*e6*sJ6*H6*e6T)
+
+                S31 .=  JHI * ((T13_1 .- Z13_1)'*e1*sJ1*H1*e1T + (T13_3 .- Z13_3)'*e3*sJ3*H3*e3T + (T13_4 .- Z13_4)'*e4*sJ4*H4*e4T + (T13_5 .- Z13_5)'*e5*sJ5*H5*e5T + (T13_6 .- Z13_6)'*e6*sJ6*H6*e6T)
+                S32 .=  JHI * ((T23_1 .- Z23_1)'*e1*sJ1*H1*e1T + (T23_3 .- Z23_3)'*e3*sJ3*H3*e3T + (T23_4 .- Z23_4)'*e4*sJ4*H4*e4T + (T23_5 .- Z23_5)'*e5*sJ5*H5*e5T + (T23_6 .- Z23_6)'*e6*sJ6*H6*e6T)    
+                S33 .=  JHI * ((T33_1 .- Z33_1)'*e1*sJ1*H1*e1T + (T33_3 .- Z33_3)'*e3*sJ3*H3*e3T + (T33_4 .- Z33_4)'*e4*sJ4*H4*e4T + (T33_5 .- Z33_5)'*e5*sJ5*H5*e5T + (T33_6 .- Z33_6)'*e6*sJ6*H6*e6T)
+            
+            else
+                error("\nError in Interface. $(int_side) not yet supported\n")
+            end
+
+
+        end
+    # Boundary Terms By Component
+    B11_f = (JHI * ((T11_1 .- Z11_1)'*lift_f1),
+             JHI * ((T11_2 .- Z11_2)'*lift_f2),
+             JHI * ((T11_3 .- Z11_3)'*lift_f3),
+             JHI * ((T11_4 .- Z11_4)'*lift_f4),
+             JHI * ((T11_5 .- Z11_5)'*lift_f5),
+             JHI * ((T11_6 .- Z11_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    B12_f = (JHI * ((T21_1 .- Z21_1)'*lift_f1),
+             JHI * ((T21_2 .- Z21_2)'*lift_f2),
+             JHI * ((T21_3 .- Z21_3)'*lift_f3),
+             JHI * ((T21_4 .- Z21_4)'*lift_f4),
+             JHI * ((T21_5 .- Z21_5)'*lift_f5),
+             JHI * ((T21_6 .- Z21_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    B13_f = (JHI * ((T31_1 .- Z31_1)'*lift_f1),
+             JHI * ((T31_2 .- Z31_2)'*lift_f2),
+             JHI * ((T31_3 .- Z31_3)'*lift_f3),
+             JHI * ((T31_4 .- Z31_4)'*lift_f4),
+             JHI * ((T31_5 .- Z31_5)'*lift_f5),
+             JHI * ((T31_6 .- Z31_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    B21_f = (JHI * ((T12_1 .- Z12_1)'*lift_f1),
+             JHI * ((T12_2 .- Z12_2)'*lift_f2),
+             JHI * ((T12_3 .- Z12_3)'*lift_f3),
+             JHI * ((T12_4 .- Z12_4)'*lift_f4),
+             JHI * ((T12_5 .- Z12_5)'*lift_f5),
+             JHI * ((T12_6 .- Z12_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    B22_f = (JHI * ((T22_1 .- Z22_1)'*lift_f1),
+             JHI * ((T22_2 .- Z22_2)'*lift_f2),
+             JHI * ((T22_3 .- Z22_3)'*lift_f3),
+             JHI * ((T22_4 .- Z22_4)'*lift_f4),
+             JHI * ((T22_5 .- Z22_5)'*lift_f5),
+             JHI * ((T22_6 .- Z22_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    B23_f = (JHI * ((T32_1 .- Z32_1)'*lift_f1),
+             JHI * ((T32_2 .- Z32_2)'*lift_f2),
+             JHI * ((T32_3 .- Z32_3)'*lift_f3),
+             JHI * ((T32_4 .- Z32_4)'*lift_f4),
+             JHI * ((T32_5 .- Z32_5)'*lift_f5),
+             JHI * ((T32_6 .- Z32_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    B31_f = (JHI * ((T13_1 .- Z13_1)'*lift_f1),
+             JHI * ((T13_2 .- Z13_2)'*lift_f2),
+             JHI * ((T13_3 .- Z13_3)'*lift_f3),
+             JHI * ((T13_4 .- Z13_4)'*lift_f4),
+             JHI * ((T13_5 .- Z13_5)'*lift_f5),
+             JHI * ((T13_6 .- Z13_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    B32_f = (JHI * ((T23_1 .- Z23_1)'*lift_f1),
+             JHI * ((T23_2 .- Z23_2)'*lift_f2),
+             JHI * ((T23_3 .- Z23_3)'*lift_f3),
+             JHI * ((T23_4 .- Z23_4)'*lift_f4),
+             JHI * ((T23_5 .- Z23_5)'*lift_f5),
+             JHI * ((T23_6 .- Z23_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    B33_f = (JHI * ((T33_1 .- Z33_1)'*lift_f1),
+             JHI * ((T33_2 .- Z33_2)'*lift_f2),
+             JHI * ((T33_3 .- Z33_3)'*lift_f3),
+             JHI * ((T33_4 .- Z33_4)'*lift_f4),
+             JHI * ((T33_5 .- Z33_5)'*lift_f5),
+             JHI * ((T33_6 .- Z33_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    HB11_f = (Hn * JHI * ((T11_1 .- Z11_1)'*lift_f1),
+              Hn * JHI * ((T11_2 .- Z11_2)'*lift_f2),
+              Hn * JHI * ((T11_3 .- Z11_3)'*lift_f3),
+              Hn * JHI * ((T11_4 .- Z11_4)'*lift_f4),
+              Hn * JHI * ((T11_5 .- Z11_5)'*lift_f5),
+              Hn * JHI * ((T11_6 .- Z11_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    HB12_f = (Hn * JHI * ((T21_1 .- Z21_1)'*lift_f1),
+              Hn * JHI * ((T21_2 .- Z21_2)'*lift_f2),
+              Hn * JHI * ((T21_3 .- Z21_3)'*lift_f3),
+              Hn * JHI * ((T21_4 .- Z21_4)'*lift_f4),
+              Hn * JHI * ((T21_5 .- Z21_5)'*lift_f5),
+              Hn * JHI * ((T21_6 .- Z21_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    HB13_f = (Hn * JHI * ((T31_1 .- Z31_1)'*lift_f1),
+              Hn * JHI * ((T31_2 .- Z31_2)'*lift_f2),
+              Hn * JHI * ((T31_3 .- Z31_3)'*lift_f3),
+              Hn * JHI * ((T31_4 .- Z31_4)'*lift_f4),
+              Hn * JHI * ((T31_5 .- Z31_5)'*lift_f5),
+              Hn * JHI * ((T31_6 .- Z31_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    HB21_f = (Hn * JHI * ((T12_1 .- Z12_1)'*lift_f1),
+             Hn * JHI * ((T12_2 .- Z12_2)'*lift_f2),
+             Hn * JHI * ((T12_3 .- Z12_3)'*lift_f3),
+             Hn * JHI * ((T12_4 .- Z12_4)'*lift_f4),
+             Hn * JHI * ((T12_5 .- Z12_5)'*lift_f5),
+             Hn * JHI * ((T12_6 .- Z12_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    HB22_f = (Hn * JHI * ((T22_1 .- Z22_1)'*lift_f1),
+             Hn * JHI * ((T22_2 .- Z22_2)'*lift_f2),
+             Hn * JHI * ((T22_3 .- Z22_3)'*lift_f3),
+             Hn * JHI * ((T22_4 .- Z22_4)'*lift_f4),
+             Hn * JHI * ((T22_5 .- Z22_5)'*lift_f5),
+             Hn * JHI * ((T22_6 .- Z22_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    HB23_f = (Hn * JHI * ((T32_1 .- Z32_1)'*lift_f1),
+             Hn * JHI * ((T32_2 .- Z32_2)'*lift_f2),
+             Hn * JHI * ((T32_3 .- Z32_3)'*lift_f3),
+             Hn * JHI * ((T32_4 .- Z32_4)'*lift_f4),
+             Hn * JHI * ((T32_5 .- Z32_5)'*lift_f5),
+             Hn * JHI * ((T32_6 .- Z32_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    HB31_f = (Hn * JHI * ((T13_1 .- Z13_1)'*lift_f1),
+             Hn * JHI * ((T13_2 .- Z13_2)'*lift_f2),
+             Hn * JHI * ((T13_3 .- Z13_3)'*lift_f3),
+             Hn * JHI * ((T13_4 .- Z13_4)'*lift_f4),
+             Hn * JHI * ((T13_5 .- Z13_5)'*lift_f5),
+             Hn * JHI * ((T13_6 .- Z13_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    HB32_f = (Hn * JHI * ((T23_1 .- Z23_1)'*lift_f1),
+             Hn * JHI * ((T23_2 .- Z23_2)'*lift_f2),
+             Hn * JHI * ((T23_3 .- Z23_3)'*lift_f3),
+             Hn * JHI * ((T23_4 .- Z23_4)'*lift_f4),
+             Hn * JHI * ((T23_5 .- Z23_5)'*lift_f5),
+             Hn * JHI * ((T23_6 .- Z23_6)'*lift_f6))
+
+    # Boundary Terms By Component
+    HB33_f = (Hn * JHI * ((T33_1 .- Z33_1)'*lift_f1),
+             Hn * JHI * ((T33_2 .- Z33_2)'*lift_f2),
+             Hn * JHI * ((T33_3 .- Z33_3)'*lift_f3),
+             Hn * JHI * ((T33_4 .- Z33_4)'*lift_f4),
+             Hn * JHI * ((T33_5 .- Z33_5)'*lift_f5),
+             Hn * JHI * ((T33_6 .- Z33_6)'*lift_f6))
+    
+    elseif mode == "bp5"
+            neumann3 = e3*sJ3*H3*e3T; neumann4 = e4*sJ4*H4*e4T; neumann5 = e5*sJ5*H5*e5T; neumann6 = e6*sJ6*H6*e6T;
+
+            S11 .=  JHI * ((T11_1 .- Z11_1)'*e1*sJ1*H1*e1T + (T11_2 .- Z11_2)'*e2*sJ2*H2*e2T) - JHI * (neumann3 * T11_3 .+ neumann4 * T11_4 .+ neumann5 * T11_5 .+ neumann6 * T11_6)
+            S12 .=  JHI * ((T21_1 .- Z21_1)'*e1*sJ1*H1*e1T + (T21_2 .- Z21_2)'*e2*sJ2*H2*e2T) - JHI * (neumann3 * T12_3 .+ neumann4 * T12_4 .+ neumann5 * T12_5 .+ neumann6 * T12_6) 
+            S13 .=  JHI * ((T31_1 .- Z31_1)'*e1*sJ1*H1*e1T + (T31_2 .- Z31_2)'*e2*sJ2*H2*e2T) - JHI * (neumann3 * T13_3 .+ neumann4 * T13_4 .+ neumann5 * T13_5 .+ neumann6 * T13_6)
+
+            S21 .=  JHI * ((T12_1 .- Z12_1)'*e1*sJ1*H1*e1T + (T12_2 .- Z12_2)'*e2*sJ2*H2*e2T) - JHI * (neumann3 * T21_3 .+ neumann4 * T21_4 .+ neumann5 * T21_5 .+ neumann6 * T21_6)
+            S22 .=  JHI * ((T22_1 .- Z22_1)'*e1*sJ1*H1*e1T + (T22_2 .- Z22_2)'*e2*sJ2*H2*e2T) - JHI * (neumann3 * T22_3 .+ neumann4 * T22_4 .+ neumann5 * T22_5 .+ neumann6 * T22_6)    
+            S23 .=  JHI * ((T32_1 .- Z32_1)'*e1*sJ1*H1*e1T + (T32_2 .- Z32_2)'*e2*sJ2*H2*e2T) - JHI * (neumann3 * T23_3 .+ neumann4 * T23_4 .+ neumann5 * T23_5 .+ neumann6 * T23_6)
+
+            S31 .=  JHI * ((T13_1 .- Z13_1)'*e1*sJ1*H1*e1T + (T13_2 .- Z13_2)'*e2*sJ2*H2*e2T) - JHI * (neumann3 * T31_3 .+ neumann4 * T31_4 .+ neumann5 * T31_5 .+ neumann6 * T31_6)
+            S32 .=  JHI * ((T23_1 .- Z23_1)'*e1*sJ1*H1*e1T + (T23_2 .- Z23_2)'*e2*sJ2*H2*e2T) - JHI * (neumann3 * T32_3 .+ neumann4 * T32_4 .+ neumann5 * T32_5 .+ neumann6 * T32_6)   
+            S33 .=  JHI * ((T33_1 .- Z33_1)'*e1*sJ1*H1*e1T + (T33_2 .- Z33_2)'*e2*sJ2*H2*e2T) - JHI * (neumann3 * T33_3 .+ neumann4 * T33_4 .+ neumann5 * T33_5 .+ neumann6 * T33_6)
+
+            # Boundary Terms By Component
+        fn3 = -JHI * lift_f3; hfn3 = Hn * fn3;
+        fn4 = -JHI * lift_f4; hfn4 = Hn * fn4;
+        fn5 = -JHI * lift_f5; hfn5 = Hn * fn5;
+        fn6 = -JHI * lift_f6; hfn6 = Hn * fn6;
+
+        B11_f = (JHI * ((T11_1 .- Z11_1)'*lift_f1),
+                 JHI * ((T11_2 .- Z11_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B12_f = (JHI * ((T21_1 .- Z21_1)'*lift_f1),
+                 JHI * ((T21_2 .- Z21_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B13_f = (JHI * ((T31_1 .- Z31_1)'*lift_f1),
+                 JHI * ((T31_2 .- Z31_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B21_f = (JHI * ((T12_1 .- Z12_1)'*lift_f1),
+                 JHI * ((T12_2 .- Z12_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B22_f = (JHI * ((T22_1 .- Z22_1)'*lift_f1),
+                 JHI * ((T22_2 .- Z22_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B23_f = (JHI * ((T32_1 .- Z32_1)'*lift_f1),
+                 JHI * ((T32_2 .- Z32_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B31_f = (JHI * ((T13_1 .- Z13_1)'*lift_f1),
+                 JHI * ((T13_2 .- Z13_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B32_f = (JHI * ((T23_1 .- Z23_1)'*lift_f1),
+                 JHI * ((T23_2 .- Z23_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B33_f = (JHI * ((T33_1 .- Z33_1)'*lift_f1),
+                 JHI * ((T33_2 .- Z33_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        HB11_f = (Hn * JHI * ((T11_1 .- Z11_1)'*lift_f1),
+                 Hn * JHI * ((T11_2 .- Z11_2)'*lift_f2),
+                 hfn3,
+                 hfn4,
+                 hfn5,
+                 hfn6)
+
+        # Boundary Terms By Component
+        HB12_f = (Hn * JHI * ((T21_1 .- Z21_1)'*lift_f1),
+                 Hn * JHI * ((T21_2 .- Z21_2)'*lift_f2),
+                 hfn3,
+                 hfn4,
+                 hfn5,
+                 hfn6)
+
+        # Boundary Terms By Component
+        HB13_f = (Hn * JHI * ((T31_1 .- Z31_1)'*lift_f1),
+                 Hn * JHI * ((T31_2 .- Z31_2)'*lift_f2),
+                 hfn3,
+                 hfn4,
+                 hfn5,
+                 hfn6)
+
+        # Boundary Terms By Component
+        HB21_f = (Hn * JHI * ((T12_1 .- Z12_1)'*lift_f1),
+                 Hn * JHI * ((T12_2 .- Z12_2)'*lift_f2),
+                 hfn3,
+                 hfn4,
+                 hfn5,
+                 hfn6)
+
+        # Boundary Terms By Component
+        HB22_f = (Hn * JHI * ((T22_1 .- Z22_1)'*lift_f1),
+                 Hn * JHI * ((T22_2 .- Z22_2)'*lift_f2),
+                 hfn3,
+                 hfn4,
+                 hfn5,
+                 hfn6)
+
+        # Boundary Terms By Component
+        HB23_f = (Hn * JHI * ((T32_1 .- Z32_1)'*lift_f1),
+                 Hn * JHI * ((T32_2 .- Z32_2)'*lift_f2),
+                 hfn3,
+                 hfn4,
+                 hfn5,
+                 hfn6)
+        # Boundary Terms By Component
+        HB31_f = (Hn * JHI * ((T13_1 .- Z13_1)'*lift_f1),
+                 Hn * JHI * ((T13_2 .- Z13_2)'*lift_f2),
+                 hfn3,
+                 hfn4,
+                 hfn5,
+                 hfn6)
+
+        # Boundary Terms By Component
+        HB32_f = (Hn * JHI * ((T23_1 .- Z23_1)'*lift_f1),
+                 Hn * JHI * ((T23_2 .- Z23_2)'*lift_f2),
+                 hfn3,
+                 hfn4,
+                 hfn5,
+                 hfn6)
+
+        # Boundary Terms By Component
+        HB33_f = (Hn * JHI * ((T33_1 .- Z33_1)'*lift_f1),
+                 Hn * JHI * ((T33_2 .- Z33_2)'*lift_f2),
+                 hfn3,
+                 hfn4,
+                 hfn5,
+                 hfn6)
+
+    elseif mode == "bp5_debug"
+            neumann3 = e3*sJ3*H3*e3T; neumann4 = e4*sJ4*H4*e4T; neumann5 = e5*sJ5*H5*e5T; neumann6 = e6*sJ6*H6*e6T;
+            
+            
+
+            S11 .=  JHI * ((T11_1 .- Z11_1)'*e1*sJ1*H1*e1T + (T11_2 .- Z11_2)'*e2*sJ2*H2*e2T + (T11_3 .- Z11_3)'*e3*sJ3*H3*e3T + (T11_4 .- Z11_4)'*e4*sJ4*H4*e4T + (T11_5 .- Z11_5)'*e5*sJ5*H5*e5T) .- JHI * neumann6 * T11_6
+            S12 .=  JHI * ((T21_1 .- Z21_1)'*e1*sJ1*H1*e1T + (T21_2 .- Z21_2)'*e2*sJ2*H2*e2T + (T21_3 .- Z21_3)'*e3*sJ3*H3*e3T + (T21_4 .- Z21_4)'*e4*sJ4*H4*e4T + (T21_5 .- Z21_5)'*e5*sJ5*H5*e5T) .- JHI * neumann6 * T12_6    
+            S13 .=  JHI * ((T31_1 .- Z31_1)'*e1*sJ1*H1*e1T + (T31_2 .- Z31_2)'*e2*sJ2*H2*e2T + (T31_3 .- Z31_3)'*e3*sJ3*H3*e3T + (T31_4 .- Z31_4)'*e4*sJ4*H4*e4T + (T31_5 .- Z31_5)'*e5*sJ5*H5*e5T) .- JHI * neumann6 * T13_6
+
+            S21 .=  JHI * ((T12_1 .- Z12_1)'*e1*sJ1*H1*e1T + (T12_2 .- Z12_2)'*e2*sJ2*H2*e2T + (T12_3 .- Z12_3)'*e3*sJ3*H3*e3T + (T12_4 .- Z12_4)'*e4*sJ4*H4*e4T + (T12_5 .- Z12_5)'*e5*sJ5*H5*e5T) .- JHI * neumann6 * T21_6
+            S22 .=  JHI * ((T22_1 .- Z22_1)'*e1*sJ1*H1*e1T + (T22_2 .- Z22_2)'*e2*sJ2*H2*e2T + (T22_3 .- Z22_3)'*e3*sJ3*H3*e3T + (T22_4 .- Z22_4)'*e4*sJ4*H4*e4T + (T22_5 .- Z22_5)'*e5*sJ5*H5*e5T) .- JHI * neumann6 * T22_6    
+            S23 .=  JHI * ((T32_1 .- Z32_1)'*e1*sJ1*H1*e1T + (T32_2 .- Z32_2)'*e2*sJ2*H2*e2T + (T32_3 .- Z32_3)'*e3*sJ3*H3*e3T + (T32_4 .- Z32_4)'*e4*sJ4*H4*e4T + (T32_5 .- Z32_5)'*e5*sJ5*H5*e5T) .- JHI * neumann6 * T23_6
+
+            S31 .=  JHI * ((T13_1 .- Z13_1)'*e1*sJ1*H1*e1T + (T13_2 .- Z13_2)'*e2*sJ2*H2*e2T + (T13_3 .- Z13_3)'*e3*sJ3*H3*e3T + (T13_4 .- Z13_4)'*e4*sJ4*H4*e4T + (T13_5 .- Z13_5)'*e5*sJ5*H5*e5T) .- JHI * neumann6 * T31_6
+            S32 .=  JHI * ((T23_1 .- Z23_1)'*e1*sJ1*H1*e1T + (T23_2 .- Z23_2)'*e2*sJ2*H2*e2T + (T23_3 .- Z23_3)'*e3*sJ3*H3*e3T + (T23_4 .- Z23_4)'*e4*sJ4*H4*e4T + (T23_5 .- Z23_5)'*e5*sJ5*H5*e5T) .- JHI * neumann6 * T32_6    
+            S33 .=  JHI * ((T33_1 .- Z33_1)'*e1*sJ1*H1*e1T + (T33_2 .- Z33_2)'*e2*sJ2*H2*e2T + (T33_3 .- Z33_3)'*e3*sJ3*H3*e3T + (T33_4 .- Z33_4)'*e4*sJ4*H4*e4T + (T33_5 .- Z33_5)'*e5*sJ5*H5*e5T) .- JHI * neumann6 * T33_6
+
+            # Boundary Terms By Component
+        fn3 = -JHI * lift_f3; hfn3 = Hn * fn3;
+        fn4 = -JHI * lift_f4; hfn4 = Hn * fn4;
+        fn5 = -JHI * lift_f5; hfn5 = Hn * fn5;
+        fn6 = -JHI * lift_f6; hfn6 = Hn * fn6;
+
+        B11_f = (JHI * ((T11_1 .- Z11_1)'*lift_f1),
+                 JHI * ((T11_2 .- Z11_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B12_f = (JHI * ((T21_1 .- Z21_1)'*lift_f1),
+                 JHI * ((T21_2 .- Z21_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B13_f = (JHI * ((T31_1 .- Z31_1)'*lift_f1),
+                 JHI * ((T31_2 .- Z31_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B21_f = (JHI * ((T12_1 .- Z12_1)'*lift_f1),
+                 JHI * ((T12_2 .- Z12_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B22_f = (JHI * ((T22_1 .- Z22_1)'*lift_f1),
+                 JHI * ((T22_2 .- Z22_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B23_f = (JHI * ((T32_1 .- Z32_1)'*lift_f1),
+                 JHI * ((T32_2 .- Z32_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B31_f = (JHI * ((T13_1 .- Z13_1)'*lift_f1),
+                 JHI * ((T13_2 .- Z13_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B32_f = (JHI * ((T23_1 .- Z23_1)'*lift_f1),
+                 JHI * ((T23_2 .- Z23_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+        B33_f = (JHI * ((T33_1 .- Z33_1)'*lift_f1),
+                 JHI * ((T33_2 .- Z33_2)'*lift_f2),
+                 fn3,
+                 fn4,
+                 fn5,
+                 fn6)
+
+        # Boundary Terms By Component
+    HB11_f = (Hn * JHI * ((T11_1 .- Z11_1)'*lift_f1),
+              Hn * JHI * ((T11_2 .- Z11_2)'*lift_f2),
+              Hn * JHI * ((T11_3 .- Z11_3)'*lift_f3),
+              Hn * JHI * ((T11_4 .- Z11_4)'*lift_f4),
+              Hn * JHI * ((T11_5 .- Z11_5)'*lift_f5),
+              hfn6)
+
+    # Boundary Terms By Component
+    HB12_f = (Hn * JHI * ((T21_1 .- Z21_1)'*lift_f1),
+              Hn * JHI * ((T21_2 .- Z21_2)'*lift_f2),
+              Hn * JHI * ((T21_3 .- Z21_3)'*lift_f3),
+              Hn * JHI * ((T21_4 .- Z21_4)'*lift_f4),
+              Hn * JHI * ((T21_5 .- Z21_5)'*lift_f5),
+              hfn6)
+
+    # Boundary Terms By Component
+    HB13_f = (Hn * JHI * ((T31_1 .- Z31_1)'*lift_f1),
+              Hn * JHI * ((T31_2 .- Z31_2)'*lift_f2),
+              Hn * JHI * ((T31_3 .- Z31_3)'*lift_f3),
+              Hn * JHI * ((T31_4 .- Z31_4)'*lift_f4),
+              Hn * JHI * ((T31_5 .- Z31_5)'*lift_f5),
+              hfn6)
+
+    # Boundary Terms By Component
+    HB21_f = (Hn * JHI * ((T12_1 .- Z12_1)'*lift_f1),
+             Hn * JHI * ((T12_2 .- Z12_2)'*lift_f2),
+             Hn * JHI * ((T12_3 .- Z12_3)'*lift_f3),
+             Hn * JHI * ((T12_4 .- Z12_4)'*lift_f4),
+             Hn * JHI * ((T12_5 .- Z12_5)'*lift_f5),
+             hfn6)
+
+    # Boundary Terms By Component
+    HB22_f = (Hn * JHI * ((T22_1 .- Z22_1)'*lift_f1),
+             Hn * JHI * ((T22_2 .- Z22_2)'*lift_f2),
+             Hn * JHI * ((T22_3 .- Z22_3)'*lift_f3),
+             Hn * JHI * ((T22_4 .- Z22_4)'*lift_f4),
+             Hn * JHI * ((T22_5 .- Z22_5)'*lift_f5),
+             hfn6)
+
+    # Boundary Terms By Component
+    HB23_f = (Hn * JHI * ((T32_1 .- Z32_1)'*lift_f1),
+             Hn * JHI * ((T32_2 .- Z32_2)'*lift_f2),
+             Hn * JHI * ((T32_3 .- Z32_3)'*lift_f3),
+             Hn * JHI * ((T32_4 .- Z32_4)'*lift_f4),
+             Hn * JHI * ((T32_5 .- Z32_5)'*lift_f5),
+             hfn6)
+
+    # Boundary Terms By Component
+    HB31_f = (Hn * JHI * ((T13_1 .- Z13_1)'*lift_f1),
+             Hn * JHI * ((T13_2 .- Z13_2)'*lift_f2),
+             Hn * JHI * ((T13_3 .- Z13_3)'*lift_f3),
+             Hn * JHI * ((T13_4 .- Z13_4)'*lift_f4),
+             Hn * JHI * ((T13_5 .- Z13_5)'*lift_f5),
+             hfn6)
+
+    # Boundary Terms By Component
+    HB32_f = (Hn * JHI * ((T23_1 .- Z23_1)'*lift_f1),
+             Hn * JHI * ((T23_2 .- Z23_2)'*lift_f2),
+             Hn * JHI * ((T23_3 .- Z23_3)'*lift_f3),
+             Hn * JHI * ((T23_4 .- Z23_4)'*lift_f4),
+             Hn * JHI * ((T23_5 .- Z23_5)'*lift_f5),
+             hfn6)
+
+    # Boundary Terms By Component
+    HB33_f = (Hn * JHI * ((T33_1 .- Z33_1)'*lift_f1),
+             Hn * JHI * ((T33_2 .- Z33_2)'*lift_f2),
+             Hn * JHI * ((T33_3 .- Z33_3)'*lift_f3),
+             Hn * JHI * ((T33_4 .- Z33_4)'*lift_f4),
+             Hn * JHI * ((T33_5 .- Z33_5)'*lift_f5),
+             hfn6)
+
+    else
+        print("ERROR");
+    end
+    B = (B11_f, B12_f, B13_f,
+         B21_f, B22_f, B23_f,
+         B31_f, B32_f, B33_f)
+
+    HB = (HB11_f, HB12_f, HB13_f,
+          HB21_f, HB22_f, HB23_f,
+          HB31_f, HB32_f, HB33_f)
+
+
+    A = [A11 A12 A13; A21 A22 A23; A31 A32 A33]
+    S = [S11 S12 S13; S21 S22 S23; S31 S32 S33]
+        
+    JH = Hn
+
+    HA = [(JH * A11) (JH * A12) (JH*A13); (JH * A21) (JH * A22) (JH*A23); (JH * A31) (JH * A32) (JH*A33)]
+    HS = [(JH * S11) (JH * S12) (JH*S13); (JH * S21) (JH * S22) (JH*S23); (JH * S31) (JH * S32) (JH*S33)]
+ 
+    M = A + S
+    HM = (HA + HS)
+
+    Z = (Z1, Z2)
+    Hf = (H1, H2, H3, H4, H5, H6)
+    
+    return (M, B, JH, HA, HS, T, e, H, JHI, HM, Z, Hf, sJs, JIm, HB, HI)
+end
+
+
+
+"""
+Normal B vec strip without H on both sides
+"""
+function bdry_vec_strip!(g, B, slip_data, remote_data, params)
+
+
+    Nqp, Nrp, Nsp = params
+    # Initialize Boundary data to 0 (g is Nqp x Nrp x Nsp x 3) 
+    g[:] .= 0
+
+    # boundary comps, remember b11[1] -> 1st comp or res times u1 of face 1, b21[3] -> 2nd comp of res times u1, face 3
+    b11, b12, b13, 
+    b21, b22, b23,
+    b31, b32, b33 = B
+
+    # fault (Dirichlet):
+    # Assume slip data comes stacked (u1, u2, u3)
+    Nface_1 = Nface_2 = Nrp * Nsp
+
+    N = Nqp * Nrp * Nsp
+
+    # Separate out the vectors for simplicity 
+    # g1_1 -> 1st comp of 1st face, g2_1 -> 2nd comp of 1st face...etc
+    g1_1 = zeros(Nface_1)
+    g2_1 = slip_data[1:Nface_1]
+    g3_1 = slip_data[(Nface_1 + 1):(2 * Nface_1)]
+    
+    # Face 1 Dir (this is the worst dont worry)
+   
+    g[1:N] .+= (b11[1] * g1_1) .+ (b12[1] * g2_1) .+ (b13[1] * g3_1)
+    g[N+1: 2*N] .+= (b21[1] * g1_1) .+ (b22[1] * g2_1) .+ (b23[1] * g3_1)
+    g[2*N + 1: 3*N] .+= (b31[1] * g1_1) .+ (b32[1] * g2_1) .+ (b33[1] * g3_1)
+    
+    # FACE 2 (Dirichlet) Not so bad tho:
+    g1_2 = remote_data[1:Nface_2]
+    g2_2 = remote_data[(Nface_2 + 1):(2 * Nface_2)]
+    g3_2 = remote_data[(2*Nface_2 + 1):(3 * Nface_2)] 
+    
+    # g1_1, g3_2 .== 0
+    g[N+1:2*N] .+= b22[2] * g2_2
+    return nothing
+
+end
+
+
+
+function computetraction_stripped(T, u, e, sJ)
+
+    # Step 1, get the correct Traction terms for face 1
+    #[ σyx; σzx]
+    # (T11_1 .- Z11_1)'*e1*sJ1*H1*e1T
+    e1, e1T = e[1]
+    N, _ = size(e1) # face 1 restriction operator
+    (T11_1, T12_1, T13_1, 
+     T21_1, T22_1, T23_1, 
+     T31_1, T32_1, T33_1)  = T[1]
+    # τ_y should be the y res of the traction == some mixed derivative and
+    # setting x traction to 0 to avoid tearing on fault 
+
+    # Do this stacking to just multply T by u, ie σyy = T21_1 u1 .+ T22_1 u2 .+ T23_1 us
+    T_2x = [T21_1 T22_1 T23_1]
+    T_3x = [T31_1 T32_1 T33_1]
+
+    # m and z should be +, but T21_.... have -1 built in 
+    τ_y_full = (-e1T * (T_2x * u)) # sJ[1][:]
+    τ_z_full = (-e1T * (T_3x * u)) # sJ[1][:]
+   
+    return [τ_y_full τ_z_full]
+  
+end
+
+#=
+Helper functions for use in BP5 Benchmarks
+=#
+
+# - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - #
+# 
+#
+# Domain and Operator Helpers
+#
+#
+# - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - #
+
+# U is stacked so U = [U1; U2; U3], U1 = [U_111, U_112, U_113, U_121, U_122, ....] for U_xyz
+
+# Start with the Basics, pull out a given constant slice
+
+"""
+Helper function to grab a scalar value at position [x, y, z] for U_dir
+    Inputs:
+        u: stacked vector in x and y and z
+        index: tuple (x_in, y_in, z_in, dir)
+        num_vals: (Nx, Ny, Nz)
+    Output:
+        Num 
+"""
+function get_value(u, indexes, num_vals)
+    # Unpack indices
+    x, y, z, comp = indexes
+   
+    Nx, Ny, Nz = num_vals
+
+    # Calc Index
+    N = Nx * Ny * Nz
+    index = ((comp - 1) * N) + ((x - 1) * (Ny * Nz)) + ((y - 1) * (Nz)) + z
+
+    return u[index]
+end
+
+"""
+LOL Im re inventing view 
+Helper function to grab a vector value at position [x, y, z] for U_dir
+    Inputs:
+        u: stacked vector in x and y and z
+        index: tuple (x_in, y_in, z_in, dir)
+            1 set on indices will be a range i.e 1:N
+        num_vals: (Nx, Ny, Nz)
+    Output:
+        Num 
+"""
+
+function get_vector(u, indexes, num_vals)
+    
+    x, y, z, comp = indexes
+    Nx, Ny, Nz = num_vals
+    
+    # Calc Index
+    N = Nx .* Ny .* Nz
+    index = ((comp .- 1) .* N) .+ ((x .- 1) .* (Ny .* Nz)) .+ ((y .- 1) .* (Nz)) .+ z
+
+    return u[index]
+end
+
+# - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - #
+# 
+#
+# Friction and Fault Helpers
+#
+#
+# - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - #
+"""
+Helper function to get the rate a state parameter correct
+"""
+function RS_r(y, z, hs, ht, H, l)
+    return max(abs(z - hs - ht - H/2) - H/2, abs(y) - (l/2)) / ht 
+end
+
+
+"""
+Function to set the rate and state parameter for the fault face in BP5
+"""
+function initialize_friction_params_vec(RS_params, grid_params, Nθ, indices)
+
+    _, y_grid, z_grid,
+    Nxp, Nyp, Nzp = grid_params
+    ht, l, lf, w, Wf, hs, H, a_min, a_max, RSDc, Vinit = RS_params
+
+    # Setup result matrix where values with be a_min, a_max, or r of a
+    cols = indices[1, 2] - indices[1, 1] + 1 # Y
+    rows = indices[2, 2] - indices[2, 1] + 1 # Z
+    res = zeros(rows*cols)
+
+    for row in 1:rows
+
+        for col in 1:cols
+
+            # adjust the indices for the actual coefficient calc, kill myself
+            y_idx = col + indices[1, 1] - 1
+            z_idx = row + indices[2, 1] - 1
+
+            idx = (row - 1) * cols + col
+
+            if abs(y_grid[y_idx]) > lf / 2 || z_grid[z_idx] > Wf
+                # Non RS zone
+                # print("$((row, col)),  $(y_grid[row]), $(z_grid[col])\n")
+               res[idx] = 0.0
+
+            elseif abs(y_grid[y_idx]) <= lf / 2 && z_grid[z_idx] <= Wf
+                
+                if (z_grid[z_idx] < hs) || (z_grid[z_idx] > hs + H + 2*ht) || (abs(y_grid[y_idx]) > l/2 + ht)
+                    # Get entire VS region
+                    res[idx] = a_max
+                elseif (z_grid[z_idx] > (hs + ht) && z_grid[z_idx] < (hs + ht + H)) && (abs(y_grid[y_idx]) < l/2)
+                    # VW and NZ
+                    res[idx] = a_min
+                else
+                    # Transition Region
+                    res[idx] = (RS_r(y_grid[y_idx], z_grid[z_idx], hs, ht, H, l) * (a_max - a_min)) + a_min
+                end
+            else
+                print("Error in VS Index setup")
+            end
+        end
+    end
+
+    return res
+
+end
+
+
+"""
+Use a function to set the theta values according to BP5 description on the fault
+
+    Inputs: 
+        - RS_params and grid params per the previous functions to get fault data
+        - A coefficients to set them correctly
+    Output:
+        - Theta: 1 x num_nodes in fault where num_nodes will be the rate and state area (VS) area < Nyp x Nzp
+        - Indices: [y1, y2;   To keep track of where the area goes from
+                    z1, z2]   Kind of funky, will be 1:N_z dir .+ 1:Nzp:NypxNzp (sub rect at z=0) 
+                    
+        - Num nodes in theta 
+
+"""
+function set_theta(RS_params, grid_params)
+    _, y_grid, z_grid,
+    Nxp, Nyp, Nzp = grid_params
+    ht, l, lf, w, Wf, hs, H, a_min, a_max, RSDc, RSVinit = RS_params
+
+    # STEP 1: Find the size of the RS zone
+
+    # Initialize stoppers
+    ny_start = 0
+    ny_end = 0
+    nz_end = 0
+
+    # Get Y nodes
+    for i in eachindex(y_grid)
+        if abs(y_grid[i]) <= lf/2 && ny_start == 0 
+            ny_start = i
+        end
+        if abs(y_grid[i]) > lf/2 && ny_end == 0 && ny_start != 0
+            ny_end = i-1
+            break
+        end
+    end
+
+    if ny_end == 0
+        ny_end = length(y_grid)
+    end
+
+    # get z nodes
+    for i in eachindex(z_grid)
+        if z_grid[i] > Wf
+            nz_end = i - 1
+            break
+        end
+    end
+
+    if ny_end == 0
+        ny_end = length(y_grid)
+    end
+
+    # Account for case where it all is in there
+    if nz_end == 0
+        nz_end = length(z_grid)
+    end
+
+    # print("\nDEBUG $(ny_start):$(ny_end), 1:$(nz_end)")
+    # initialize theta
+    θ = RSDc ./ RSVinit .* ones((nz_end) * (ny_end - ny_start + 1))
+    
+    return (θ, 
+            [ny_start ny_end; 1 nz_end;], 
+            (nz_end) * (ny_end - ny_start + 1))
+end
+            
+"""
+Modify τ term for BP5 Problem setup in Nucleation zone of Rate and State fault
+
+τ is a stacked vector [τy, τz] , but only τy is affected here
+"""
+function set_prestress_QD!(τ0, RS_params, grid_params, τ_params, Nθ, indices, Dc)
+    _, y_grid, z_grid,
+    Nxp, Nyp, Nzp = grid_params
+    ht, l, lf, w, Wf, hs, H, a_min, a_max, RSDc, Vinit = RS_params
+    Vi, V0, Vinit, σn, η, RSb, RSf0 = τ_params 
+
+    cols = indices[1, 2] - indices[1, 1] + 1 # Y
+    rows = indices[2, 2] - indices[2, 1] + 1 # Z
+    
+    for row in 1:rows
+
+        for col in 1:cols
+            
+            y_idx = col + indices[1, 1] - 1
+            z_idx = row + indices[2, 1] - 1
+            idx = (row - 1) * cols + col
+
+            if abs(y_grid[y_idx]) > lf / 2 || z_grid[z_idx] > Wf
+                # in non rs zone 
+                nothing
+
+            elseif abs(y_grid[y_idx]) <= lf / 2 && z_grid[z_idx] <= Wf
+                
+                if (z_grid[z_idx] <= hs) || (z_grid[z_idx] >= hs + H + 2*ht) || (abs(y_grid[y_idx]) >= l/2 + ht)
+                    # Get entire VS region
+                    nothing
+                # GET Nucleation Zone here: First check Z requirements, then 1sided NZ
+                elseif (z_grid[z_idx] >= hs + ht && z_grid[z_idx] <= hs + ht + H) && (y_grid[y_idx] >= -l/2 && y_grid[y_idx] <= -l/2 + w)
+                    # Update τ0
+                    τ0[idx] = σn * a_min * asinh( (Vi / (2*V0)) * exp((RSf0 + RSb * log(V0 / Vinit)) / a_min) ) + (η * Vi)
+                    Dc[idx] = 0.13
+                else
+                    # Transition Region + VW not in W
+                    nothing
+
+                end
+            else
+                print("Error in VS Index setup")
+            end
+        end
+    end
+
+end
+
+"""
+Function to set the rate and state τ for the fault face in BP5 after a traction update
+"""
+function update_tau_v_vec(τ_full, v_full, RS_params, grid_params, Nθ, indices)
+
+    _, y_grid, z_grid,
+    Nxp, Nyp, Nzp = grid_params
+    ht, l, lf, w, Wf, hs, H, a_min, a_max, RSDc, Vinit = RS_params
+
+    # Setup result matrix where values with be a_min, a_max, or r of a
+    cols = indices[1, 2] - indices[1, 1] + 1 # Y
+    rows = indices[2, 2] - indices[2, 1] + 1 # Z
+    N = rows * cols
+    res_t2 = zeros(N)
+    res_t3 = zeros(N)
+    res_v2 = zeros(N)
+    res_v3 = zeros(N)
+    
+    for row in 1:rows
+
+        for col in 1:cols
+
+            # adjust the indices for the actual coefficient calc, kill myself
+            y_idx = col + indices[1, 1] - 1
+            z_idx = row + indices[2, 1] - 1
+            actual_idx = (z_idx - 1) * Nyp + y_idx
+            idx = (row - 1) * cols + col
+
+            if abs(y_grid[y_idx]) > lf / 2 || z_grid[z_idx] > Wf
+                # Non RS zone
+                # print("$((row, col)),  $(y_grid[row]), $(z_grid[col])\n")
+               print("Error in VS Index setup")
+
+            elseif abs(y_grid[y_idx]) <= lf / 2 && z_grid[z_idx] <= Wf
+        
+                res_t2[idx] = τ_full[actual_idx] # set τy
+                res_t3[idx] = τ_full[actual_idx + (Nyp * Nzp)] # set τz since they're stacked
+                res_v2[idx] = v_full[actual_idx] # set τy
+                res_v3[idx] = v_full[actual_idx + (Nyp * Nzp)]
+              
+            else
+                print("Error in VS Index setup")
+            end
+        end
+    end
+
+    return res_t2, res_t3, res_v2, res_v3
+
+end
+
+"""
+Taken straight outta Alex's code lets goooo
+"""
+
+function rateandstate_vectorized(V_v, ψ, σn, τ_v, η, RSas, RSV0)
+    # V and τ both stand for absolute value of slip rate and traction vecxtors. 
+    Y_v = (1 ./ (2 .* RSV0)) .* exp.(ψ ./ RSas)
+    f_v = RSas .* asinh.(V_v .* Y_v)
+    dfdV_v = RSas .* (1 ./ sqrt.(1 .+ (V_v .* Y_v) .^ 2)) .* Y_v
+  
+    g_v = σn .* f_v .+ η .* V_v .- τ_v
+    dgdV_v = σn .* dfdV_v .+ η
+    return (g_v, dgdV_v)
+end
+
+function newtbndv_vectorized(rateandstate_vectorized, xL, xR, V_v, ψ, σn, τ_v, η, 
+                        RSas, RSV0; ftol=1e-6, maxiter = 500, minchange = 0, atolx = 1e-4, rtolx=1e-4)
+    fL_v = rateandstate_vectorized(xL, ψ, σn, τ_v, η, RSas, RSV0)[1]
+    fR_v = rateandstate_vectorized(xR, ψ, σn, τ_v, η, RSas, RSV0)[1]
+
+    if any(x -> x > 0, fL_v .* fR_v)
+        return (fill(NaN, length(V_v)), fill(NaN, length(V_v)), -maxiter)
+    end
+
+    f_v, df_v = rateandstate_vectorized(V_v, ψ, σn, τ_v, η, RSas, RSV0)
+    dxlr_v = xR .- xL
+
+    for iter = 1:maxiter
+        dV_v = -f_v ./ df_v
+        V_v = V_v .+ dV_v
+        
+        mask = (V_v .< xL) .| (V_v .> xR) .| (abs.(dV_v) ./ dxlr_v .< minchange)
+        V_v[mask] .= (xR[mask] .+ xL[mask]) ./ 2
+        dV_v[mask] .= (xR[mask] .- xL[mask]) ./ 2
+
+        f_v = rateandstate_vectorized(V_v, ψ, σn, τ_v, η, RSas, RSV0)[1]
+        df_v = rateandstate_vectorized(V_v, ψ, σn, τ_v, η, RSas, RSV0)[2]
+        
+        mask_2 = f_v .* fL_v .> 0
+        fL_v[mask_2] .= f_v[mask_2]
+        xL[mask_2] .= V_v[mask_2]
+        fR_v[.!mask_2] .= f_v[.!mask_2]
+        xR[.!mask_2] .= V_v[.!mask_2]
+
+        dxlr_v .= xR .- xL
+
+        if all(abs.(f_v) .< ftol) && all(abs.(dV_v .< atolx .+ rtolx .* (abs.(dV_v) .+ abs.(V_v))))
+            return (V_v, f_v, iter)
+        end
+    end
+    return (V_v, f_v, -maxiter)
+
+end
+
+"""
+Update the actual RS velocity
+"""
+function update_V_RS_zone!(V, V_updates, RS_params, grid_params, Nθ, indices)
+
+    _, y_grid, z_grid,
+    Nxp, Nyp, Nzp = grid_params
+    ht, l, lf, w, Wf, hs, H, a_min, a_max, RSDc, Vinit = RS_params
+    Vy, Vz = V_updates
+
+    # Setup result matrix where values with be a_min, a_max, or r of a
+    cols = indices[1, 2] - indices[1, 1] + 1 # y
+    rows = indices[2, 2] - indices[2, 1] + 1 # z
+    res_y = zeros(rows*cols)
+    res_z = zeros(rows*cols)
+
+    for row in 1:rows
+
+        for col in 1:cols
+
+            # adjust the indices for the actual coefficient calc, kill myself
+            y_idx = col + indices[1, 1] - 1
+            z_idx = row + indices[2, 1] - 1
+            actual_idx = (z_idx - 1) * Nyp + y_idx
+            idx = (row - 1) * cols + col
+
+            if abs(y_grid[y_idx]) > lf / 2 || z_grid[z_idx] > Wf
+                # Non RS zone
+                # print("$((row, col)),  $(y_grid[row]), $(z_grid[col])\n")
+               nothing
+
+            elseif abs(y_grid[y_idx]) <= lf / 2 && z_grid[z_idx] <= Wf
+        
+                V[actual_idx] = Vy[idx] # set τy
+                V[actual_idx + (Nyp * Nzp)] = Vz[idx]
+                
+            else
+                print("Error in VS Index setup")
+            end
+        end
+    end
+
+    return [res_y res_z]
+end
+
+ # Function that finds the depth-index corresponding to a station location
+function find_station_index(stations, y_grid, z_grid)
+      numstations = length(stations)
+      station_ind = zeros(numstations, 2)
+      for i in range(1, stop=numstations)
+        station_ind[i, 1] = argmin(abs.(y_grid .- stations[i][1])) # get y indx
+        station_ind[i, 2] = argmin(abs.(z_grid .- stations[i][2])) # get z indx
+      end
+    return Integer.(station_ind)
+end
+# - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - #
+# 
+#
+# File and IO Helpers
+#
+#
+# - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - # - #
+
+            
+function read_params_BP5(f_name)
+    f = open(f_name, "r")
+    tmp_params = []
+    while ! eof(f)
+        s = readline(f)
+        if s[1] != '#'
+            push!(tmp_params, split(s, '=')[2])
+            flush(stdout)
+        end
+    end
+  close(f)
+
+ 
+    #=  (pth, stride_space, stride_time, SBPp
+        xc, yc, zc
+        Hx, Hy, Hz, 
+        Nx, Ny, Nz, 
+        ρ, cs, ν, 
+        RSamin, RSamax, RSb
+        σn, RSDc, Vp,
+        RSV0, RSf0, RShs
+        RSht, RSH, RSl
+        RSlf, W, Δz,
+        sim years) = read_params(localARGS[1])
+    =#
+    params = Vector{Any}(undef, 36)
+    params[1] = strip(tmp_params[1]) # pth
+    params[2] = parse(Int64, tmp_params[2]) # stride_space
+    params[3] = parse(Int64, tmp_params[3]) # stride_time
+    params[4] = parse(Int64, tmp_params[4]) # SBPp 
+    params[5] = (parse(Float64, tmp_params[5]), parse(Float64, tmp_params[6])) # xc
+    params[6] = (parse(Float64, tmp_params[7]), parse(Float64, tmp_params[8])) # yc
+    params[7] = (parse(Float64, tmp_params[9]), parse(Float64, tmp_params[10])) # zc
+    params[8] = parse(Int64, tmp_params[11]) # Hx
+    params[9] = parse(Int64, tmp_params[12]) # Hy
+    params[10] = parse(Int64, tmp_params[13]) # Hz
+    params[11] = parse(Int64, tmp_params[14]) # Nx
+    params[12] = parse(Int64, tmp_params[15]) # Ny
+    params[13] = parse(Int64, tmp_params[16]) # Nz
+    params[14] = parse(Bool, tmp_params[17]) # cg flag
+    params[15] = parse(Bool, tmp_params[18]) # gpu flag
+    for i = 19:length(tmp_params)
+      params[i-3] = parse(Float64, tmp_params[i])
+    end
+    
+  return params
+end
+
+
+
+

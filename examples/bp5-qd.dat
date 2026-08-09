@@ -1,0 +1,93 @@
+# Input parameter file. 
+# Solves the SEAS benchmark problem BP5:
+# https://strike.scec.org/cvws/seas/download/SEAS_BP5.pdf
+#
+# details of output data:
+# path to directory that stores output data
+pth = ./TEST/
+# write-out every "stride_space" grid points along fault
+stride_space = 1
+# write-out every "stride_time" time steps
+stride_time = 20
+#
+# SBP interior spatial order of accuracy
+SBPp   = 2
+#
+# # # # # # # # # # # # # # # # # 
+# Model Specific Domain Params: #
+# # # # # # # # # # # # # # # # # 
+# computational domain size
+# x-domain is (Lx1, Lx2) (km)
+Lx1 = 0
+Lx2 = 128
+# y-domain is (Ly1, Ly2) (km)
+Ly1 = -64
+Ly2 =  64
+# z-domain is (Lz1, Lz2) (km)
+Lz1 = 0
+Lz2 = 128
+#
+# dimensions in which constant grid-spacing is applied:
+Hx = 5
+Hy = 5
+Hz = 5 
+#
+# number of grid points in each dimension 
+# make sure to resolve h* and l_b; should be written as integer.
+Nx = 128
+Ny = 128
+Nz = 128
+# # # # # # # # # # # # # # # # # # # # # 
+# # # # # # # # # # # # # # # # # # # # # 
+# Driver options
+# # # # # # # # # # # # # # # # # # # # # 
+# # # # # # # # # # # # # # # # # # # # #
+# Use Conjugate Gradient or Backslash
+shift_flag = false
+# Use GPU to solve
+gpu_flag = true
+# # # # # # # # # # # # # # # # # # # # # 
+# # # # # # # # # # # # # # # # # # # # #
+# # # # # # # # # # # # # # # # # # # # #
+# Actual elastcity and BP5 Table Params #
+# # # # # # # # # # # # # # # # # # # # #
+# # # # # # # # # # # # # # # # # # # # # 
+# # # # # # # # # # # # # # # # # # # # # 
+ρ = 2.670
+cs = 3.464
+ν = 0.25
+# rate-and-state friction parameters
+RSamin = 0.004
+RSamax = 0.04
+RSb = 0.03
+# effective normal stress
+σn = 100
+# critical slip distance
+RSDc = 0.56
+# plate loading rate
+Vp = 1e-9
+# initial slip rate
+RSVinit = 1e-9
+# reference slip rate
+RSV0 = 1e-6
+# reference friction coefficient
+RSf0 = 0.6
+# Width of shallow VS zone
+RShs = 2
+# Width of VW to VS zone
+RSht = 2
+# Width of VW region
+RSH = 12
+# length of uniform VW region
+RSl = 60
+# width of rate and state fault
+RSWf = 40
+# length of rate and state fault
+RSlf = 100
+# width of favorable nucleation zone
+w = 12
+# suggested cell cize (m)
+Δz = 1000
+# how many years to simulate
+sim_years = 1800
+# END of DAT file
